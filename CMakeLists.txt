@@ -24,6 +24,8 @@ target_link_libraries(quorum_sim PRIVATE quorum_warnings)
 
 add_library(quorum_raft
   src/raft/messages.cpp
+  src/raft/cluster.cpp
+  src/raft/invariants.cpp
   src/raft/node.cpp
 )
 target_include_directories(quorum_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
