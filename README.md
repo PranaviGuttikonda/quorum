@@ -2,8 +2,8 @@
 
 A Raft-based replicated key-value store in C++20, tested with deterministic simulation.
 
-> **Status:** step 1 of the roadmap: build setup and a deterministic simulated network.
-> There is no Raft logic yet.
+> **Status:** step 2 of the roadmap: leader election (Raft §5.2) on a deterministic
+> simulated network. There is no log replication yet.
 
 ## Why deterministic simulation
 
@@ -26,7 +26,12 @@ To run only some tests, pass a substring of their names:
 
 ```sh
 ./build/tests/quorum_tests network_partition
+./build/tests/quorum_tests election_
 ```
+
+The election fuzz test runs 1,000 seeds with random crashes, partitions and 10% message
+loss, and checks election safety after every tick. A failure prints its seed, and the same
+seed replays the same run exactly.
 
 The code builds with `-Wall -Wextra -Werror`. CI runs on Ubuntu and macOS in Debug and
 Release.
@@ -34,10 +39,11 @@ Release.
 ## Layout
 
 ```
-include/quorum/   public headers
-src/              implementation
-tests/            test harness and tests
-docs/             design notes
+include/quorum/sim/    deterministic RNG, tick clock, simulated network
+include/quorum/raft/   Raft node, messages, storage, test cluster, invariant checkers
+src/                   implementation
+tests/                 test harness and tests
+docs/                  design notes
 ```
 
 ## Roadmap

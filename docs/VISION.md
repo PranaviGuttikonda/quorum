@@ -20,9 +20,9 @@ replayed exactly from its seed.
 
 ## Roadmap
 
-0. **Foundation** *(current)*: CMake build, test harness, CI, a seeded RNG, a tick clock,
+0. **Foundation** *(done)*: CMake build, test harness, CI, a seeded RNG, a tick clock,
    and a simulated network with delay, loss, partitions and crash/restart.
-1. **Leader election**: terms, `RequestVote`, randomized election timeouts and
+1. **Leader election** *(current)*: terms, `RequestVote`, randomized election timeouts and
    heartbeats. Safety check: at most one leader per term.
 2. **Log replication**: `AppendEntries`, the log-matching property, commit index
    advancement, and follower catch-up after lag.
