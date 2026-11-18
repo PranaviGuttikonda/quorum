@@ -1,0 +1,16 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+out/
+compile_commands.json
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Local assistant config (never committed)
+.claude/
+CLAUDE.md
