@@ -5,6 +5,7 @@ add_executable(quorum_tests
   sim/clock_test.cpp
   sim/network_test.cpp
   raft/messages_test.cpp
+  raft/node_test.cpp
 )
 target_include_directories(quorum_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(quorum_tests PRIVATE quorum_raft quorum_warnings)
