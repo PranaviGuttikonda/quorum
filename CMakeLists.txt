@@ -15,5 +15,11 @@ endif()
 add_library(quorum_warnings INTERFACE)
 target_compile_options(quorum_warnings INTERFACE -Wall -Wextra -Werror)
 
+add_library(quorum_sim
+  src/sim/rng.cpp
+)
+target_include_directories(quorum_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(quorum_sim PRIVATE quorum_warnings)
+
 enable_testing()
 add_subdirectory(tests)
