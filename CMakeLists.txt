@@ -22,5 +22,11 @@ add_library(quorum_sim
 target_include_directories(quorum_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(quorum_sim PRIVATE quorum_warnings)
 
+add_library(quorum_raft
+  src/raft/messages.cpp
+)
+target_include_directories(quorum_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(quorum_raft PUBLIC quorum_sim PRIVATE quorum_warnings)
+
 enable_testing()
 add_subdirectory(tests)
