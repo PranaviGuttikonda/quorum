@@ -16,6 +16,7 @@ add_library(quorum_warnings INTERFACE)
 target_compile_options(quorum_warnings INTERFACE -Wall -Wextra -Werror)
 
 add_library(quorum_sim
+  src/sim/network.cpp
   src/sim/rng.cpp
 )
 target_include_directories(quorum_sim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

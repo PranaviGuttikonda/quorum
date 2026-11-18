@@ -3,6 +3,7 @@ add_executable(quorum_tests
   harness_test.cpp
   sim/rng_test.cpp
   sim/clock_test.cpp
+  sim/network_test.cpp
 )
 target_include_directories(quorum_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(quorum_tests PRIVATE quorum_sim quorum_warnings)
