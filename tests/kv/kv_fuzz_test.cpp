@@ -1,6 +1,6 @@
 // Given: the KV store must stay correct under the step 3 fault schedules
 //        while clients keep issuing operations and retrying.
-// Approach: for each of 1,000 seeds per schedule, three simulated clients run
+// Approach: for each seed (QUORUM_FUZZ_SEEDS, default 1,000) per schedule, three simulated clients run
 //           random put/get/delete/cas operations on a few hot keys, with the
 //           Raft safety checkers on every tick. After the faults stop, every
 //           client finishes its outstanding operation. Then:
@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "fault_injector.h"
+#include "fuzz_seeds.h"
 #include "harness.h"
 #include "quorum/kv/cluster.h"
 #include "quorum/raft/invariants.h"
@@ -36,7 +37,8 @@ using quorum::testing::FaultProfile;
 
 namespace {
 
-constexpr std::uint64_t kSeeds = 1000;
+// QUORUM_FUZZ_SEEDS, default 1000 (tests/fuzz_seeds.h).
+std::uint64_t seeds() { return quorum::testing::fuzz_seeds(); }
 constexpr Tick kFaultTicks = 4000;
 constexpr Tick kSettleBound = 5000;
 constexpr double kOpRate = 0.3;  // per idle client per tick
@@ -174,7 +176,7 @@ FuzzResult run_seed(std::uint64_t seed, const FaultProfile& p) {
 
 FuzzResult run_all(const FaultProfile& p, const char* name) {
     FuzzResult total;
-    for (std::uint64_t seed = 1; seed <= kSeeds; ++seed) {
+    for (std::uint64_t seed = 1; seed <= seeds(); ++seed) {
         const FuzzResult r = run_seed(seed, p);
         if (!r.failure.empty())
             quorum::test::fail(__FILE__, __LINE__,
@@ -192,26 +194,26 @@ FuzzResult run_all(const FaultProfile& p, const char* name) {
 
 }  // namespace
 
-TEST(kv_fuzz_general_across_1000_seeds) {
+TEST(kv_fuzz_general_across_seeds) {
     const FuzzResult t = run_all(FaultProfile::general(), "general");
     // Observed per seed: ~149 completed operations, ~73 client timeouts,
     // ~122 redirects and ~89 retries absorbed by the session table. The
     // floors are about half that.
-    CHECK(t.completed > 75 * kSeeds);
-    CHECK(t.timeouts > 35 * kSeeds);
-    CHECK(t.redirects > 60 * kSeeds);
-    CHECK(t.deduplicated > 40 * kSeeds);
+    CHECK(t.completed > 75 * seeds());
+    CHECK(t.timeouts > 35 * seeds());
+    CHECK(t.redirects > 60 * seeds());
+    CHECK(t.deduplicated > 40 * seeds());
     CHECK(t.settle_ticks < kSettleBound);
 }
 
-TEST(kv_fuzz_nemesis_across_1000_seeds) {
+TEST(kv_fuzz_nemesis_across_seeds) {
     const FuzzResult t = run_all(FaultProfile::nemesis(), "nemesis");
     // Observed per seed: ~79 completed, ~79 timeouts, ~163 redirects, ~51
     // absorbed retries.
-    CHECK(t.completed > 40 * kSeeds);
-    CHECK(t.timeouts > 40 * kSeeds);
-    CHECK(t.redirects > 80 * kSeeds);
-    CHECK(t.deduplicated > 25 * kSeeds);
+    CHECK(t.completed > 40 * seeds());
+    CHECK(t.timeouts > 40 * seeds());
+    CHECK(t.redirects > 80 * seeds());
+    CHECK(t.deduplicated > 25 * seeds());
     CHECK(t.settle_ticks < kSettleBound);
 }
 

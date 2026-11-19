@@ -1,6 +1,6 @@
 // Given: Election Safety must hold under any mix of faults, not just scripted
 //        ones.
-// Approach: for each of 1,000 seeds, run a 5-node cluster with 10% message
+// Approach: for each seed (QUORUM_FUZZ_SEEDS, default 1,000), run a 5-node cluster with 10% message
 //           loss and a seed-driven schedule of crashes, restarts, partitions
 //           and heals. ElectionSafetyChecker runs after every tick. Then clear
 //           all faults and require the cluster to settle on one leader
@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "fuzz_seeds.h"
 #include "harness.h"
 #include "quorum/raft/cluster.h"
 #include "quorum/raft/invariants.h"
@@ -21,7 +22,8 @@ using quorum::sim::Rng;
 
 namespace {
 
-constexpr std::uint64_t kSeeds = 1000;
+// QUORUM_FUZZ_SEEDS, default 1000 (tests/fuzz_seeds.h).
+std::uint64_t seeds() { return quorum::testing::fuzz_seeds(); }
 constexpr Tick kFaultTicks = 4000;
 constexpr Tick kSettleBound = 5000;
 constexpr std::size_t kNodes = 5;
@@ -100,10 +102,10 @@ FuzzResult run_seed(std::uint64_t seed) {
 
 }  // namespace
 
-TEST(election_fuzz_safety_across_1000_seeds) {
+TEST(election_fuzz_safety_across_seeds) {
     std::uint64_t total_crashes = 0, total_partitions = 0, total_terms = 0;
     Tick worst_settle = 0;
-    for (std::uint64_t seed = 1; seed <= kSeeds; ++seed) {
+    for (std::uint64_t seed = 1; seed <= seeds(); ++seed) {
         const FuzzResult r = run_seed(seed);
         if (!r.safe)
             quorum::test::fail(__FILE__, __LINE__, "seed " + std::to_string(seed) + ": " + r.violation);
@@ -118,9 +120,9 @@ TEST(election_fuzz_safety_across_1000_seeds) {
     }
     // The fault schedule really ran. Observed per seed: ~15 crashes, ~5
     // partitions and ~5 terms with a leader. The floors are about half that.
-    CHECK(total_crashes > 7 * kSeeds);
-    CHECK(total_partitions > 2 * kSeeds);
-    CHECK(total_terms > 3 * kSeeds);
+    CHECK(total_crashes > 7 * seeds());
+    CHECK(total_partitions > 2 * seeds());
+    CHECK(total_terms > 3 * seeds());
     CHECK(worst_settle < kSettleBound);
 }
 

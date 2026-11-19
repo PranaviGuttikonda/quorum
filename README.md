@@ -38,6 +38,9 @@ also checks that every replica ends up with the same map, and that every client 
 executed exactly once. A failure prints its seed, and the same seed replays the same run
 exactly.
 
+Each fuzz test runs `QUORUM_FUZZ_SEEDS` seeds (default 1000), for example
+`QUORUM_FUZZ_SEEDS=200 ./build/tests/quorum_tests`. CI uses 200 in Debug and 1000 in Release.
+
 The code builds with `-Wall -Wextra -Werror`. CI runs on Ubuntu and macOS in Debug and
 Release.
 

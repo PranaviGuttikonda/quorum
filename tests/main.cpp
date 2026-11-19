@@ -3,6 +3,7 @@
 #include <cstring>
 #include <exception>
 
+#include "fuzz_seeds.h"
 #include "harness.h"
 
 namespace quorum::test {
@@ -43,5 +44,12 @@ int run_all(const char* filter) {
 }  // namespace quorum::test
 
 int main(int argc, char** argv) {
+    try {
+        std::printf("fuzz seeds: %llu (QUORUM_FUZZ_SEEDS)\n\n",
+                    static_cast<unsigned long long>(quorum::testing::fuzz_seeds()));
+    } catch (const std::exception& e) {
+        std::printf("%s\n", e.what());
+        return 2;
+    }
     return quorum::test::run_all(argc > 1 ? argv[1] : nullptr);
 }

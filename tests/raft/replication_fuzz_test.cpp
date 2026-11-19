@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "fault_injector.h"
+#include "fuzz_seeds.h"
 #include "harness.h"
 #include "quorum/raft/cluster.h"
 #include "quorum/raft/invariants.h"
@@ -30,7 +31,8 @@ using quorum::testing::FaultProfile;
 
 namespace {
 
-constexpr std::uint64_t kSeeds = 1000;
+// QUORUM_FUZZ_SEEDS, default 1000 (tests/fuzz_seeds.h).
+std::uint64_t seeds() { return quorum::testing::fuzz_seeds(); }
 constexpr Tick kFaultTicks = 4000;
 constexpr Tick kSettleBound = 5000;
 
@@ -145,10 +147,10 @@ FuzzResult run_seed(std::uint64_t seed, const Profile& p = {}) {
 
 }  // namespace
 
-TEST(replication_fuzz_safety_and_convergence_across_1000_seeds) {
+TEST(replication_fuzz_safety_and_convergence_across_seeds) {
     FuzzResult total;
     Tick worst_settle = 0;
-    for (std::uint64_t seed = 1; seed <= kSeeds; ++seed) {
+    for (std::uint64_t seed = 1; seed <= seeds(); ++seed) {
         const FuzzResult r = run_seed(seed);
         if (!r.failure.empty())
             quorum::test::fail(__FILE__, __LINE__, "seed " + std::to_string(seed) + ": " + r.failure);
@@ -164,11 +166,11 @@ TEST(replication_fuzz_safety_and_convergence_across_1000_seeds) {
     // ~263 committed entries, ~18 entries removed by conflict truncation,
     // ~343 duplicate deliveries, ~15 crashes and ~5 partitions. The floors are
     // about half that.
-    CHECK(total.committed > 130 * kSeeds);
-    CHECK(total.truncated > 9 * kSeeds);
-    CHECK(total.duplicated > 170 * kSeeds);
-    CHECK(total.crashes > 7 * kSeeds);
-    CHECK(total.partitions > 2 * kSeeds);
+    CHECK(total.committed > 130 * seeds());
+    CHECK(total.truncated > 9 * seeds());
+    CHECK(total.duplicated > 170 * seeds());
+    CHECK(total.crashes > 7 * seeds());
+    CHECK(total.partitions > 2 * seeds());
     CHECK(worst_settle < kSettleBound);
 }
 
@@ -192,10 +194,10 @@ Profile nemesis() {
     return p;
 }
 
-TEST(replication_fuzz_nemesis_across_1000_seeds) {
+TEST(replication_fuzz_nemesis_across_seeds) {
     const Profile p = nemesis();
     FuzzResult total;
-    for (std::uint64_t seed = 1; seed <= kSeeds; ++seed) {
+    for (std::uint64_t seed = 1; seed <= seeds(); ++seed) {
         const FuzzResult r = run_seed(seed, p);
         if (!r.failure.empty())
             quorum::test::fail(__FILE__, __LINE__,
@@ -208,8 +210,8 @@ TEST(replication_fuzz_nemesis_across_1000_seeds) {
     // Observed per seed: ~65 committed entries, ~5.6 entries removed by
     // conflict truncation, ~16 crashes and ~52 partitions. The floors are
     // about half that.
-    CHECK(total.committed > 30 * kSeeds);
-    CHECK(total.truncated > 2 * kSeeds);
-    CHECK(total.crashes > 8 * kSeeds);
-    CHECK(total.partitions > 25 * kSeeds);
+    CHECK(total.committed > 30 * seeds());
+    CHECK(total.truncated > 2 * seeds());
+    CHECK(total.crashes > 8 * seeds());
+    CHECK(total.partitions > 25 * seeds());
 }

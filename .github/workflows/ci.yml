@@ -29,4 +29,7 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Test
+        # Debug builds are several times slower, so they run fewer fuzz seeds.
+        env:
+          QUORUM_FUZZ_SEEDS: ${{ matrix.build_type == 'Debug' && '200' || '1000' }}
         run: ctest --test-dir build --output-on-failure
