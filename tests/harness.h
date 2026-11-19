@@ -72,8 +72,9 @@ int run_all(const char* filter);
 
 #define CHECK_EQ(a, b)                                                           \
     do {                                                                         \
-        const auto& qt_a = (a);                                                  \
-        const auto& qt_b = (b);                                                  \
+        /* Copies, not references: (a) may refer into a temporary. */            \
+        const auto qt_a = (a);                                                   \
+        const auto qt_b = (b);                                                   \
         if (!(qt_a == qt_b))                                                     \
             ::quorum::test::fail(__FILE__, __LINE__,                             \
                                  "CHECK_EQ(" #a ", " #b "): " +                  \
