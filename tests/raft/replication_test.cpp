@@ -218,7 +218,7 @@ TEST(replication_conflicting_uncommitted_entries_are_overwritten) {
             CHECK_SEED(seed, commands(k.c.node(id)->log()) == want);
             CHECK_SEED(seed, commands(k.c.applied(id)) == want);
         }
-        CHECK_SEED(seed, k.c.storage(*old_leader).truncated_entries() >= 3);
+        CHECK_SEED(seed, k.c.truncated_entries(*old_leader) >= 3);
         for (const auto& e : k.logs.applied_history())
             CHECK_SEED(seed, e.command.rfind("lost-", 0) != 0);  // never applied anywhere
         if (!k.ok()) quorum::test::fail(__FILE__, __LINE__, k.why());

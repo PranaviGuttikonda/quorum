@@ -3,15 +3,27 @@
 #include <stdexcept>
 #include <utility>
 
+#include "quorum/sim/disk.h"
+
 namespace quorum::raft {
+
+Storage& MemoryStorageProvider::boot(NodeId id) {
+    auto& s = storage_[id];
+    if (!s) s = std::make_unique<MemoryStorage>();
+    return *s;
+}
 
 // Given: one seed must determine the network and every node's randomness.
 // Approach: a root Rng gives the network its seed, then forks one parent
 //           stream per node. Each boot of a node forks again from its parent,
 //           so a restarted node gets fresh but reproducible timeouts.
 RaftCluster::RaftCluster(std::uint64_t seed, std::size_t size, RaftConfig raft,
-                         sim::NetworkConfig net, ServiceFactory services)
-    : raft_config_(raft), net_(sim::Rng(seed).next_u64(), net), service_factory_(std::move(services)) {
+                         sim::NetworkConfig net, ServiceFactory services,
+                         std::shared_ptr<StorageProvider> storage)
+    : raft_config_(raft),
+      net_(sim::Rng(seed).next_u64(), net),
+      storage_(storage ? std::move(storage) : std::make_shared<MemoryStorageProvider>()),
+      service_factory_(std::move(services)) {
     if (size == 0) throw std::invalid_argument("RaftCluster: size must be >= 1");
     validate(raft_config_);
     sim::Rng root(seed);
@@ -19,17 +31,21 @@ RaftCluster::RaftCluster(std::uint64_t seed, std::size_t size, RaftConfig raft,
 
     for (NodeId id = 1; id <= size; ++id) ids_.push_back(id);
     for (NodeId id : ids_) {
-        storage_.emplace(id, std::make_unique<MemoryStorage>());
         node_rngs_.emplace(id, root.fork());
         services_[id];
         net_.add_node(id, [this, id](const sim::Message& m) {
             // SimNetwork never delivers to a crashed node, but stay defensive.
             auto it = nodes_.find(id);
-            if (it == nodes_.end() || !it->second) return;
-            if (is_server(m.from)) {
-                it->second->receive(m.from, m.payload);
-            } else if (const auto& svc = services_.at(id)) {
-                svc->on_client_message(m.from, m.payload);
+            if (it == nodes_.end() || !it->second || doomed_.count(id)) return;
+            try {
+                if (is_server(m.from)) {
+                    it->second->receive(m.from, m.payload);
+                } else if (const auto& svc = services_.at(id)) {
+                    svc->on_client_message(m.from, m.payload);
+                }
+            } catch (const sim::DiskCrash&) {
+                // Crashing here would change the network mid-delivery.
+                doomed_.insert(id);
             }
         });
     }
@@ -37,10 +53,15 @@ RaftCluster::RaftCluster(std::uint64_t seed, std::size_t size, RaftConfig raft,
 }
 
 void RaftCluster::boot(NodeId id) {
+    Storage& storage = storage_->boot(id);  // recovery; may throw
+    live_storage_[id] = &storage;
     std::vector<NodeId> peers;
     for (NodeId p : ids_)
         if (p != id) peers.push_back(p);
-    auto send = [this, id](NodeId to, std::string payload) { net_.send(id, to, std::move(payload)); };
+    auto send = [this, id](NodeId to, std::string payload) {
+        live_storage_.at(id)->sync();  // the durability barrier
+        net_.send(id, to, std::move(payload));
+    };
     auto apply = [this, id](LogIndex index, const LogEntry& entry) {
         auto& applied = applied_.at(id);
         if (index != applied.size() + 1)
@@ -50,7 +71,7 @@ void RaftCluster::boot(NodeId id) {
     };
     applied_[id].clear();
     ++boots_[id];
-    nodes_[id] = std::make_unique<RaftNode>(id, std::move(peers), raft_config_, *storage_.at(id),
+    nodes_[id] = std::make_unique<RaftNode>(id, std::move(peers), raft_config_, storage,
                                             send, node_rngs_.at(id).fork(), std::move(apply));
     if (service_factory_) services_[id] = service_factory_(id, *nodes_[id], send);
 }
@@ -69,9 +90,27 @@ void RaftCluster::client_send(NodeId from, NodeId to, std::string payload) {
 
 void RaftCluster::tick() {
     net_.tick();
-    for (NodeId id : ids_)
-        if (auto& n = nodes_.at(id)) n->tick();
+    crash_doomed();
+    for (NodeId id : ids_) {
+        if (auto& n = nodes_.at(id)) {
+            try {
+                n->tick();
+            } catch (const sim::DiskCrash&) {
+                doomed_.insert(id);
+            }
+        }
+    }
+    crash_doomed();
     for (const auto& obs : observers_) obs(*this);
+}
+
+void RaftCluster::crash_doomed() {
+    const std::set<NodeId> doomed = std::move(doomed_);
+    doomed_.clear();
+    for (NodeId id : doomed) {
+        crash(id);
+        ++disk_crashes_;
+    }
 }
 
 void RaftCluster::run_for(Tick ticks) {
@@ -93,7 +132,13 @@ void RaftCluster::add_observer(Observer observer) {
 ProposeResult RaftCluster::propose(NodeId id, std::string command) {
     auto& n = nodes_.at(id);
     if (!n) return NotLeader{std::nullopt};
-    return n->propose(std::move(command));
+    try {
+        return n->propose(std::move(command));
+    } catch (const sim::DiskCrash&) {
+        crash(id);
+        ++disk_crashes_;
+        return NotLeader{std::nullopt};
+    }
 }
 
 void RaftCluster::crash(NodeId id) {
@@ -101,13 +146,29 @@ void RaftCluster::crash(NodeId id) {
     if (!n) return;
     net_.crash(id);
     services_.at(id).reset();  // it may refer to the node
+    truncated_[id] += n->truncated_entries();
     n.reset();
+    live_storage_.erase(id);
+    storage_->crash(id);
 }
 
 void RaftCluster::restart(NodeId id) {
     if (nodes_.at(id)) return;
+    try {
+        boot(id);
+    } catch (const sim::DiskCrash&) {
+        live_storage_.erase(id);
+        storage_->crash(id);
+        ++disk_crashes_;
+        return;
+    }
     net_.restart(id);
-    boot(id);
+}
+
+std::uint64_t RaftCluster::truncated_entries(NodeId id) const {
+    const RaftNode* n = node(id);
+    const auto it = truncated_.find(id);
+    return (it == truncated_.end() ? 0 : it->second) + (n ? n->truncated_entries() : 0);
 }
 
 bool RaftCluster::is_up(NodeId id) const {

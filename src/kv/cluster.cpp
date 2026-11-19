@@ -5,7 +5,7 @@
 namespace quorum::kv {
 
 KvCluster::KvCluster(std::uint64_t seed, KvClusterConfig config)
-    : raft_(seed, config.servers, config.raft, config.net, KvService::factory()) {
+    : raft_(seed, config.servers, config.raft, config.net, KvService::factory(), config.storage) {
     // A separate stream for clients, so their choices don't depend on
     // how many draws the cluster made.
     sim::Rng client_root(seed ^ 0xc11e47c11e47c11eULL);

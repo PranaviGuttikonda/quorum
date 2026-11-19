@@ -159,6 +159,7 @@ void RaftNode::handle(NodeId from, const AppendEntries& m) {
             if (keep < commit_index_)
                 throw std::logic_error("RaftNode: conflict truncation below commitIndex");
             ++truncations_;
+            truncated_entries_ += last_log_index() - keep;
         }
         const std::span<const LogEntry> fresh(m.entries.data() + k, m.entries.size() - k);
         storage_.write_log(keep, fresh);

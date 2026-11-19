@@ -27,6 +27,8 @@ struct KvClusterConfig {
     raft::RaftConfig raft{};
     sim::NetworkConfig net{};
     ClientConfig client{};
+    // Null means MemoryStorage.
+    std::shared_ptr<raft::StorageProvider> storage;
 };
 
 class KvCluster {

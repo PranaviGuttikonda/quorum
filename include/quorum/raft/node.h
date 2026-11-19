@@ -100,6 +100,8 @@ public:
     LogIndex last_applied() const { return last_applied_; }
     // Number of conflict truncations since this node object was created.
     std::uint64_t truncations() const { return truncations_; }
+    // Entries removed by those truncations.
+    std::uint64_t truncated_entries() const { return truncated_entries_; }
 
     // Leader-only replication state (meaningless in other roles).
     LogIndex next_index(NodeId peer) const { return next_index_.at(peer); }
@@ -147,6 +149,7 @@ private:
     Tick election_timeout_ = 0;
     Tick heartbeat_elapsed_ = 0;
     std::uint64_t truncations_ = 0;
+    std::uint64_t truncated_entries_ = 0;
 
     // Volatile, leader only: reinitialized by become_leader().
     std::map<NodeId, LogIndex> next_index_;

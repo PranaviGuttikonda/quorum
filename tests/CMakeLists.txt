@@ -12,6 +12,7 @@ add_executable(quorum_tests
   raft/log_invariants_test.cpp
   raft/service_test.cpp
   raft/file_storage_test.cpp
+  raft/durability_test.cpp
   raft/replication_test.cpp
   raft/replication_fuzz_test.cpp
   raft/election_test.cpp

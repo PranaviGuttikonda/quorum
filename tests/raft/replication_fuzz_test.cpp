@@ -140,7 +140,7 @@ FuzzResult run_seed(std::uint64_t seed, const Profile& p = {}) {
     }
     r.crashes = faults.crashes;
     r.partitions = faults.partitions;
-    for (NodeId id : c.ids()) r.truncated += c.storage(id).truncated_entries();
+    for (NodeId id : c.ids()) r.truncated += c.truncated_entries(id);
     r.duplicated = c.network().stats().duplicated;
     return r;
 }
