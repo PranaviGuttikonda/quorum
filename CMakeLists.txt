@@ -35,6 +35,7 @@ add_library(quorum_kv
   src/kv/command.cpp
   src/kv/client.cpp
   src/kv/cluster.cpp
+  src/kv/linearizability.cpp
   src/kv/service.cpp
   src/kv/state_machine.cpp
 )

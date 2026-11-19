@@ -15,6 +15,7 @@ add_executable(quorum_tests
   raft/election_fuzz_test.cpp
   kv/state_machine_test.cpp
   kv/kv_test.cpp
+  kv/linearizability_test.cpp
   kv/kv_fuzz_test.cpp
 )
 target_include_directories(quorum_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
