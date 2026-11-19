@@ -31,5 +31,12 @@ add_library(quorum_raft
 target_include_directories(quorum_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(quorum_raft PUBLIC quorum_sim PRIVATE quorum_warnings)
 
+add_library(quorum_kv
+  src/kv/command.cpp
+  src/kv/state_machine.cpp
+)
+target_include_directories(quorum_kv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(quorum_kv PUBLIC quorum_raft PRIVATE quorum_warnings)
+
 enable_testing()
 add_subdirectory(tests)
