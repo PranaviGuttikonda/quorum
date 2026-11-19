@@ -28,11 +28,12 @@ replayed exactly from its seed.
    advancement, and follower catch-up after lag.
 3. **Key-value state machine** *(done)*: `get` / `put` / `delete` applied from committed entries,
    a client API with leader redirection, and request de-duplication.
-4. **Fault testing** *(current: linearizability checking)*: randomized simulations that run many seeds with partitions,
+4. **Fault testing** *(done)*: randomized simulations that run many seeds with partitions,
    crashes, message loss and reordering. Invariant checkers cover election safety, log
    matching, leader completeness and state-machine safety. They print a minimal
    reproducing seed on failure.
-5. **Persistence**: durable term, vote and log through a storage interface, a simulated
+5. **Persistence** *(current: durable storage and crash recovery done; snapshots and log
+   compaction not started)*: durable term, vote and log through a storage interface, a simulated
    disk with crash-consistency faults, and snapshots with log compaction.
 6. **Visualizer**: export simulation traces and step through a run to see elections,
    replication and faults over time.
