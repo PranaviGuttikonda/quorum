@@ -15,7 +15,17 @@ endif()
 add_library(quorum_warnings INTERFACE)
 target_compile_options(quorum_warnings INTERFACE -Wall -Wextra -Werror)
 
+# Given: the file layer sits below Raft, and SimDisk only needs its header.
+# Approach: quorum_storage has no quorum dependencies.
+add_library(quorum_storage
+  src/storage/crc32.cpp
+  src/storage/posix_fs.cpp
+)
+target_include_directories(quorum_storage PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(quorum_storage PRIVATE quorum_warnings)
+
 add_library(quorum_sim
+  src/sim/disk.cpp
   src/sim/network.cpp
   src/sim/rng.cpp
 )
@@ -29,7 +39,7 @@ add_library(quorum_raft
   src/raft/node.cpp
 )
 target_include_directories(quorum_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(quorum_raft PUBLIC quorum_sim PRIVATE quorum_warnings)
+target_link_libraries(quorum_raft PUBLIC quorum_sim quorum_storage PRIVATE quorum_warnings)
 
 add_library(quorum_kv
   src/kv/command.cpp

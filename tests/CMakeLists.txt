@@ -4,6 +4,8 @@ add_executable(quorum_tests
   sim/rng_test.cpp
   sim/clock_test.cpp
   sim/network_test.cpp
+  sim/disk_test.cpp
+  storage/crc32_test.cpp
   raft/messages_test.cpp
   raft/node_test.cpp
   raft/replication_node_test.cpp
