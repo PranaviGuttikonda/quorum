@@ -1,7 +1,5 @@
-// Given: the term and vote rules are easiest to pin down on one node in
-//        isolation.
-// Approach: drive a RaftNode by hand: tick it, feed it encoded messages, and
-//           decode what it sends from a captured outbox. No network involved.
+// Given: the election rules (§5.2) pinned down on a single node.
+// Approach: NodeHarness drives the node by hand; no network involved.
 
 #include "quorum/raft/node.h"
 
@@ -13,64 +11,12 @@
 #include <vector>
 
 #include "harness.h"
+#include "node_harness.h"
 
 using namespace quorum::raft;
 using quorum::sim::Rng;
 
-namespace {
-
-struct Sent {
-    NodeId to;
-    RaftMessage msg;
-};
-
-struct Harness {
-    MemoryStorage storage;
-    std::vector<Sent> outbox;
-    RaftConfig config{};
-    std::optional<RaftNode> node;
-
-    explicit Harness(std::vector<NodeId> peers = {2, 3, 4, 5}, std::uint64_t seed = 1) {
-        boot(std::move(peers), seed);
-    }
-
-    // Simulates a (re)start: a brand-new node object over the same storage.
-    void boot(std::vector<NodeId> peers = {2, 3, 4, 5}, std::uint64_t seed = 1) {
-        node.emplace(NodeId{1}, std::move(peers), config, storage,
-                     [this](NodeId to, std::string payload) {
-                         auto m = decode(payload);
-                         if (!m) quorum::test::fail(__FILE__, __LINE__, "node sent garbage: " + payload);
-                         outbox.push_back({to, *m});
-                     },
-                     Rng(seed));
-    }
-
-    void deliver(NodeId from, const RaftMessage& m) { node->receive(from, encode(m)); }
-
-    void tick(Tick n = 1) {
-        for (Tick i = 0; i < n; ++i) node->tick();
-    }
-
-    // Ticks until the node becomes a candidate. Returns the number of ticks.
-    Tick tick_until_candidate() {
-        for (Tick t = 1; t <= config.election_timeout_max; ++t) {
-            node->tick();
-            if (node->role() == Role::Candidate) return t;
-        }
-        quorum::test::fail(__FILE__, __LINE__, "no election within election_timeout_max");
-    }
-
-    template <class T>
-    std::vector<std::pair<NodeId, T>> take() {
-        std::vector<std::pair<NodeId, T>> out;
-        for (const Sent& s : outbox)
-            if (const T* m = std::get_if<T>(&s.msg)) out.emplace_back(s.to, *m);
-        outbox.clear();
-        return out;
-    }
-};
-
-}  // namespace
+using Harness = quorum::raft::testing::NodeHarness;
 
 TEST(raft_node_config_is_validated) {
     CHECK_THROWS(validate(RaftConfig{150, 300, 0}));

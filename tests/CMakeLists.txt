@@ -6,6 +6,7 @@ add_executable(quorum_tests
   sim/network_test.cpp
   raft/messages_test.cpp
   raft/node_test.cpp
+  raft/replication_node_test.cpp
   raft/election_test.cpp
   raft/election_fuzz_test.cpp
 )
