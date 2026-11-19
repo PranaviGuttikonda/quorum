@@ -2,9 +2,9 @@
 
 A Raft-based replicated key-value store in C++20, tested with deterministic simulation.
 
-> **Status:** step 4 of the roadmap: a replicated key-value store (put, get, delete, cas)
+> **Status:** step 5 of the roadmap: a replicated key-value store (put, get, delete, cas)
 > with exactly-once client requests, on Raft (§5.2–5.4, §8), on a deterministic simulated
-> network.
+> network. Every fuzzed client history is checked for linearizability.
 
 ## Why deterministic simulation
 
@@ -34,8 +34,9 @@ To run only some tests, pass a substring of their names:
 The fuzz tests run 1,000 seeds each with random crashes, partitions, 10% message loss and
 10% duplicate delivery while clients keep writing. Invariant checkers run after every tick:
 Election Safety, Log Matching, State Machine Safety and Leader Completeness. The KV fuzz
-also checks that every replica ends up with the same map, and that every client operation
-executed exactly once. A failure prints its seed, and the same seed replays the same run
+also checks every client history for linearizability, with a Wing & Gong/Porcupine-style
+checker that explains any failure. It checks that every replica ends up with the same map,
+and that every write executed exactly once. A failure prints its seed, and the same seed replays the same run
 exactly.
 
 Each fuzz test runs `QUORUM_FUZZ_SEEDS` seeds (default 1000), for example
