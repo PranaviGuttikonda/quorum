@@ -33,6 +33,9 @@ target_link_libraries(quorum_raft PUBLIC quorum_sim PRIVATE quorum_warnings)
 
 add_library(quorum_kv
   src/kv/command.cpp
+  src/kv/client.cpp
+  src/kv/cluster.cpp
+  src/kv/service.cpp
   src/kv/state_machine.cpp
 )
 target_include_directories(quorum_kv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
