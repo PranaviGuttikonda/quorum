@@ -6,9 +6,15 @@
 // Approach: load() returns everything for recovery. Writes are incremental:
 //           term and vote together, and the log as "keep the first N entries,
 //           then append these", which covers both append and conflict
-//           truncation in one call. MemoryStorage outlives the RaftNode (the
-//           cluster owns it), so a simulated crash keeps its state. A
-//           disk-backed version comes in step 6.
+//           truncation in one call.
+//   - Durability: save_term_and_vote is durable when it returns. write_log
+//     may be buffered, and is durable once sync() returns. The host calls
+//     sync() before anything the node or its service produced leaves the
+//     server (RaftCluster does it on every send), so all the log writes of
+//     one step share one fsync.
+//   - MemoryStorage outlives the RaftNode (the cluster's provider owns it),
+//     so a simulated crash keeps all of it. FileStorage (file_storage.h) is
+//     the disk-backed version.
 
 #include <cstdint>
 #include <optional>
@@ -32,11 +38,13 @@ class Storage {
 public:
     virtual ~Storage() = default;
     virtual PersistentState load() const = 0;
-    // Each write must be durable when it returns.
+    // Durable when it returns.
     virtual void save_term_and_vote(Term term, std::optional<NodeId> voted_for) = 0;
     // Keeps entries 1..keep and appends `entries` after them. Throws if keep
-    // is beyond the end of the log.
+    // is beyond the end of the log. Durable after the next sync().
     virtual void write_log(LogIndex keep, std::span<const LogEntry> entries) = 0;
+    // Makes every earlier write durable. Cheap when there is nothing to sync.
+    virtual void sync() = 0;
 };
 
 class MemoryStorage final : public Storage {
@@ -58,6 +66,8 @@ public:
         state_.log.insert(state_.log.end(), entries.begin(), entries.end());
         ++log_writes_;
     }
+
+    void sync() override {}
 
     std::uint64_t hard_state_writes() const { return hard_state_writes_; }
     std::uint64_t log_writes() const { return log_writes_; }

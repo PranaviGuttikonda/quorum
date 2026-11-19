@@ -11,6 +11,7 @@ add_executable(quorum_tests
   raft/replication_node_test.cpp
   raft/log_invariants_test.cpp
   raft/service_test.cpp
+  raft/file_storage_test.cpp
   raft/replication_test.cpp
   raft/replication_fuzz_test.cpp
   raft/election_test.cpp
