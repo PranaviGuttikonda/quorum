@@ -35,8 +35,17 @@ void RaftCluster::boot(NodeId id) {
     for (NodeId p : ids_)
         if (p != id) peers.push_back(p);
     auto send = [this, id](NodeId to, std::string payload) { net_.send(id, to, std::move(payload)); };
+    auto apply = [this, id](LogIndex index, const LogEntry& entry) {
+        auto& applied = applied_.at(id);
+        if (index != applied.size() + 1)
+            throw std::logic_error("RaftCluster: node applied out of order");
+        applied.push_back(entry);
+    };
+    applied_[id].clear();
+    ++boots_[id];
     nodes_[id] = std::make_unique<RaftNode>(id, std::move(peers), raft_config_, *storage_.at(id),
-                                            std::move(send), node_rngs_.at(id).fork());
+                                            std::move(send), node_rngs_.at(id).fork(),
+                                            std::move(apply));
 }
 
 void RaftCluster::tick() {
@@ -60,6 +69,12 @@ bool RaftCluster::run_until(const std::function<bool(const RaftCluster&)>& pred,
 
 void RaftCluster::add_observer(Observer observer) {
     observers_.push_back(std::move(observer));
+}
+
+ProposeResult RaftCluster::propose(NodeId id, std::string command) {
+    auto& n = nodes_.at(id);
+    if (!n) return NotLeader{std::nullopt};
+    return n->propose(std::move(command));
 }
 
 void RaftCluster::crash(NodeId id) {
