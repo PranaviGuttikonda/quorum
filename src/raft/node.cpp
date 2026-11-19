@@ -103,19 +103,19 @@ void RaftNode::handle(NodeId from, const RequestVoteReply& m) {
 //           passes, so any current-term AppendEntries succeeds.
 void RaftNode::handle(NodeId from, const AppendEntries& m) {
     if (m.term < current_term_) {
-        send(from, AppendEntriesReply{current_term_, false});
+        send(from, AppendEntriesReply{current_term_, false, 0, 0});
         return;
     }
     if (role_ == Role::Leader) {
         // Two leaders in one term would violate election safety. Election
         // safety says this can't happen, so reject without changing state.
-        send(from, AppendEntriesReply{current_term_, false});
+        send(from, AppendEntriesReply{current_term_, false, 0, 0});
         return;
     }
     role_ = Role::Follower;
     leader_id_ = m.leader_id;
     reset_election_timer();
-    send(from, AppendEntriesReply{current_term_, true});
+    send(from, AppendEntriesReply{current_term_, true, 0, 0});
 }
 
 void RaftNode::handle(NodeId, const AppendEntriesReply&) {
@@ -166,7 +166,7 @@ void RaftNode::step_down(Term term) {
 
 void RaftNode::send_heartbeats() {
     heartbeat_elapsed_ = 0;
-    const AppendEntries ae{current_term_, id_, last_log_index(), last_log_term(), 0};
+    const AppendEntries ae{current_term_, id_, last_log_index(), last_log_term(), 0, {}};
     for (NodeId peer : peers_) send(peer, ae);
 }
 
@@ -178,7 +178,7 @@ void RaftNode::reset_election_timer() {
 }
 
 void RaftNode::persist() {
-    storage_.save(PersistentState{current_term_, voted_for_});
+    storage_.save_term_and_vote(current_term_, voted_for_);
 }
 
 void RaftNode::send(NodeId to, const RaftMessage& msg) {

@@ -3,8 +3,7 @@
 #include <charconv>
 #include <cstdint>
 #include <limits>
-#include <sstream>
-#include <vector>
+#include <string>
 
 namespace quorum::raft {
 
@@ -15,41 +14,104 @@ struct Overloaded : Fs... {
     using Fs::operator()...;
 };
 
-// Given: a payload of single-space-separated fields.
-// Approach: split on ' ', rejecting empty fields, so leading, trailing or
-//           doubled spaces all fail.
-std::optional<std::vector<std::string_view>> split(std::string_view s) {
-    std::vector<std::string_view> out;
-    std::size_t start = 0;
-    for (;;) {
-        const std::size_t sp = s.find(' ', start);
-        const std::string_view field = s.substr(start, sp - start);
-        if (field.empty()) return std::nullopt;
-        out.push_back(field);
-        if (sp == std::string_view::npos) return out;
-        start = sp + 1;
+// Given: fields separated by exactly one space, some of them raw byte strings
+//        whose length was given by the previous field.
+// Approach: a cursor that requires a single ' ' before every field except the
+//           first. Empty tokens, doubled or trailing spaces, and short byte
+//           strings all fail.
+class Reader {
+public:
+    explicit Reader(std::string_view s) : s_(s) {}
+
+    std::optional<std::string_view> token() {
+        if (!separator()) return std::nullopt;
+        std::size_t end = s_.find(' ', pos_);
+        if (end == std::string_view::npos) end = s_.size();
+        if (end == pos_) return std::nullopt;
+        const std::string_view t = s_.substr(pos_, end - pos_);
+        pos_ = end;
+        return t;
     }
-}
 
-// Approach: from_chars accepts no sign, whitespace or prefix, so "+1", " 1"
-//           and "0x1" are all rejected. The whole field must be consumed.
-std::optional<std::uint64_t> parse_u64(std::string_view f) {
-    std::uint64_t v = 0;
-    const auto [ptr, ec] = std::from_chars(f.data(), f.data() + f.size(), v);
-    if (ec != std::errc{} || ptr != f.data() + f.size()) return std::nullopt;
-    return v;
-}
+    // Approach: from_chars accepts no sign, whitespace or prefix, so "+1",
+    //           " 1" and "0x1" are all rejected. The whole token must be used.
+    std::optional<std::uint64_t> u64() {
+        const auto t = token();
+        if (!t) return std::nullopt;
+        std::uint64_t v = 0;
+        const auto [ptr, ec] = std::from_chars(t->data(), t->data() + t->size(), v);
+        if (ec != std::errc{} || ptr != t->data() + t->size()) return std::nullopt;
+        return v;
+    }
 
-std::optional<NodeId> parse_node(std::string_view f) {
-    const auto v = parse_u64(f);
-    if (!v || *v > std::numeric_limits<NodeId>::max()) return std::nullopt;
-    return static_cast<NodeId>(*v);
-}
+    std::optional<NodeId> node() {
+        const auto v = u64();
+        if (!v || *v > std::numeric_limits<NodeId>::max()) return std::nullopt;
+        return static_cast<NodeId>(*v);
+    }
 
-std::optional<bool> parse_bool(std::string_view f) {
-    if (f == "0") return false;
-    if (f == "1") return true;
-    return std::nullopt;
+    std::optional<bool> flag() {
+        const auto t = token();
+        if (t == "0") return false;
+        if (t == "1") return true;
+        return std::nullopt;
+    }
+
+    std::optional<std::string_view> bytes(std::uint64_t n) {
+        if (!separator() || n > s_.size() - pos_) return std::nullopt;
+        const std::string_view b = s_.substr(pos_, n);
+        pos_ += n;
+        return b;
+    }
+
+    std::size_t remaining() const { return s_.size() - pos_; }
+    bool done() const { return pos_ == s_.size(); }
+
+private:
+    bool separator() {
+        if (first_) {
+            first_ = false;
+            return true;
+        }
+        if (pos_ < s_.size() && s_[pos_] == ' ') {
+            ++pos_;
+            return true;
+        }
+        return false;
+    }
+
+    std::string_view s_;
+    std::size_t pos_ = 0;
+    bool first_ = true;
+};
+
+std::optional<RaftMessage> decode_ae(Reader& r) {
+    AppendEntries m;
+    const auto term = r.u64();
+    const auto leader = r.node();
+    const auto pidx = r.u64();
+    const auto pterm = r.u64();
+    const auto commit = r.u64();
+    const auto n = r.u64();
+    if (!term || !leader || !pidx || !pterm || !commit || !n) return std::nullopt;
+    // Every entry takes at least 5 bytes (" 0 0 " for an empty command), so a
+    // count that can't fit is rejected before anything is allocated.
+    if (*n > r.remaining() / 5) return std::nullopt;
+    m.term = *term;
+    m.leader_id = *leader;
+    m.prev_log_index = *pidx;
+    m.prev_log_term = *pterm;
+    m.leader_commit = *commit;
+    m.entries.reserve(*n);
+    for (std::uint64_t i = 0; i < *n; ++i) {
+        const auto et = r.u64();
+        const auto len = r.u64();
+        if (!et || !len) return std::nullopt;
+        const auto cmd = r.bytes(*len);
+        if (!cmd) return std::nullopt;
+        m.entries.push_back(LogEntry{*et, std::string(*cmd)});
+    }
+    return m;
 }
 
 }  // namespace
@@ -59,63 +121,78 @@ Term term_of(const RaftMessage& msg) {
 }
 
 std::string encode(const RaftMessage& msg) {
-    std::ostringstream os;
+    std::string out;
+    auto put = [&out](std::uint64_t v) {
+        out += ' ';
+        out += std::to_string(v);
+    };
     std::visit(Overloaded{
                    [&](const RequestVote& m) {
-                       os << "RV " << m.term << ' ' << m.candidate_id << ' ' << m.last_log_index
-                          << ' ' << m.last_log_term;
+                       out = "RV";
+                       put(m.term);
+                       put(m.candidate_id);
+                       put(m.last_log_index);
+                       put(m.last_log_term);
                    },
                    [&](const RequestVoteReply& m) {
-                       os << "RVR " << m.term << ' ' << (m.vote_granted ? 1 : 0);
+                       out = "RVR";
+                       put(m.term);
+                       put(m.vote_granted ? 1 : 0);
                    },
                    [&](const AppendEntries& m) {
-                       os << "AE " << m.term << ' ' << m.leader_id << ' ' << m.prev_log_index << ' '
-                          << m.prev_log_term << ' ' << m.leader_commit;
+                       out = "AE";
+                       put(m.term);
+                       put(m.leader_id);
+                       put(m.prev_log_index);
+                       put(m.prev_log_term);
+                       put(m.leader_commit);
+                       put(m.entries.size());
+                       for (const LogEntry& e : m.entries) {
+                           put(e.term);
+                           put(e.command.size());
+                           out += ' ';
+                           out += e.command;
+                       }
                    },
                    [&](const AppendEntriesReply& m) {
-                       os << "AER " << m.term << ' ' << (m.success ? 1 : 0);
+                       out = "AER";
+                       put(m.term);
+                       put(m.success ? 1 : 0);
+                       put(m.match_index);
+                       put(m.last_log_index);
                    },
                },
                msg);
-    return os.str();
+    return out;
 }
 
 std::optional<RaftMessage> decode(std::string_view payload) {
-    const auto fields = split(payload);
-    if (!fields || fields->empty()) return std::nullopt;
-    const auto& f = *fields;
-    const std::string_view tag = f[0];
+    Reader r(payload);
+    const auto tag = r.token();
+    if (!tag) return std::nullopt;
 
-    if (tag == "RV" && f.size() == 5) {
-        const auto term = parse_u64(f[1]);
-        const auto cand = parse_node(f[2]);
-        const auto idx = parse_u64(f[3]);
-        const auto lterm = parse_u64(f[4]);
-        if (!term || !cand || !idx || !lterm) return std::nullopt;
-        return RequestVote{*term, *cand, *idx, *lterm};
+    std::optional<RaftMessage> out;
+    if (*tag == "RV") {
+        const auto term = r.u64();
+        const auto cand = r.node();
+        const auto idx = r.u64();
+        const auto lterm = r.u64();
+        if (term && cand && idx && lterm) out = RequestVote{*term, *cand, *idx, *lterm};
+    } else if (*tag == "RVR") {
+        const auto term = r.u64();
+        const auto granted = r.flag();
+        if (term && granted) out = RequestVoteReply{*term, *granted};
+    } else if (*tag == "AE") {
+        out = decode_ae(r);
+    } else if (*tag == "AER") {
+        const auto term = r.u64();
+        const auto ok = r.flag();
+        const auto match = r.u64();
+        const auto last = r.u64();
+        if (term && ok && match && last) out = AppendEntriesReply{*term, *ok, *match, *last};
     }
-    if (tag == "RVR" && f.size() == 3) {
-        const auto term = parse_u64(f[1]);
-        const auto granted = parse_bool(f[2]);
-        if (!term || !granted) return std::nullopt;
-        return RequestVoteReply{*term, *granted};
-    }
-    if (tag == "AE" && f.size() == 6) {
-        const auto term = parse_u64(f[1]);
-        const auto leader = parse_node(f[2]);
-        const auto pidx = parse_u64(f[3]);
-        const auto pterm = parse_u64(f[4]);
-        const auto commit = parse_u64(f[5]);
-        if (!term || !leader || !pidx || !pterm || !commit) return std::nullopt;
-        return AppendEntries{*term, *leader, *pidx, *pterm, *commit};
-    }
-    if (tag == "AER" && f.size() == 3) {
-        const auto term = parse_u64(f[1]);
-        const auto ok = parse_bool(f[2]);
-        if (!term || !ok) return std::nullopt;
-        return AppendEntriesReply{*term, *ok};
-    }
-    return std::nullopt;
+    if (!out || !r.done()) return std::nullopt;
+    return out;
 }
 
 }  // namespace quorum::raft

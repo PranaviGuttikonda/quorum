@@ -112,7 +112,7 @@ TEST(raft_node_follower_times_out_and_requests_votes) {
     CHECK_EQ(h.tick_until_candidate(), expected);
     CHECK_EQ(h.node->current_term(), Term{1});
     CHECK_EQ(h.node->voted_for(), std::optional<NodeId>{1});
-    CHECK((h.storage.load() == PersistentState{1, NodeId{1}}));  // persisted before sending
+    CHECK((h.storage.load() == PersistentState{1, NodeId{1}, {}}));  // persisted before sending
 
     const auto rvs = h.take<RequestVote>();
     CHECK_EQ(rvs.size(), std::size_t{4});
@@ -143,7 +143,7 @@ TEST(raft_node_grants_at_most_one_vote_per_term) {
     CHECK((replies[0] == std::pair<NodeId, RequestVoteReply>{2, {1, true}}));
     CHECK((replies[1] == std::pair<NodeId, RequestVoteReply>{3, {1, false}}));
     CHECK((replies[2] == std::pair<NodeId, RequestVoteReply>{2, {1, true}}));
-    CHECK((h.storage.load() == PersistentState{1, NodeId{2}}));
+    CHECK((h.storage.load() == PersistentState{1, NodeId{2}, {}}));
 }
 
 TEST(raft_node_new_term_allows_a_new_vote) {
@@ -157,7 +157,7 @@ TEST(raft_node_new_term_allows_a_new_vote) {
 
 TEST(raft_node_rejects_stale_term_vote_request) {
     Harness h;
-    h.deliver(2, AppendEntries{5, 2, 0, 0, 0});
+    h.deliver(2, AppendEntries{5, 2, 0, 0, 0, {}});
     h.take<AppendEntriesReply>();
     h.deliver(3, RequestVote{4, 3, 0, 0});
     const auto r = h.take<RequestVoteReply>();
@@ -181,8 +181,8 @@ TEST(raft_node_steps_down_on_higher_term_in_any_message) {
         const Term t = 7;
         RaftMessage m = kind == 0   ? RaftMessage{RequestVote{t, 3, 0, 0}}
                         : kind == 1 ? RaftMessage{RequestVoteReply{t, false}}
-                        : kind == 2 ? RaftMessage{AppendEntries{t, 3, 0, 0, 0}}
-                                    : RaftMessage{AppendEntriesReply{t, false}};
+                        : kind == 2 ? RaftMessage{AppendEntries{t, 3, 0, 0, 0, {}}}
+                                    : RaftMessage{AppendEntriesReply{t, false, 0, 0}};
         h.deliver(3, m);
         CHECK(h.node->role() == Role::Follower);
         CHECK_EQ(h.node->current_term(), t);
@@ -215,7 +215,7 @@ TEST(raft_node_becomes_leader_with_majority_and_heartbeats) {
     h.tick();
     const auto hb = h.take<AppendEntries>();
     CHECK_EQ(hb.size(), std::size_t{4});
-    CHECK((hb[0].second == AppendEntries{1, 1, 0, 0, 0}));
+    CHECK((hb[0].second == AppendEntries{1, 1, 0, 0, 0, {}}));
 
     // A leader never times out into a new election.
     h.tick(10 * h.config.election_timeout_max);
@@ -237,18 +237,18 @@ TEST(raft_node_candidate_yields_to_current_leader) {
     Harness h;
     h.tick_until_candidate();
     h.outbox.clear();
-    h.deliver(3, AppendEntries{1, 3, 0, 0, 0});
+    h.deliver(3, AppendEntries{1, 3, 0, 0, 0, {}});
     CHECK(h.node->role() == Role::Follower);
     CHECK_EQ(h.node->current_term(), Term{1});
     CHECK_EQ(h.node->leader_id(), std::optional<NodeId>{3});
-    CHECK((h.take<AppendEntriesReply>().at(0).second == AppendEntriesReply{1, true}));
+    CHECK((h.take<AppendEntriesReply>().at(0).second == AppendEntriesReply{1, true, 0, 0}));
 }
 
 TEST(raft_node_heartbeats_suppress_elections) {
     Harness h;
     for (int i = 0; i < 100; ++i) {
         h.tick(h.config.election_timeout_min - 1);
-        h.deliver(2, AppendEntries{1, 2, 0, 0, 0});
+        h.deliver(2, AppendEntries{1, 2, 0, 0, 0, {}});
     }
     CHECK(h.node->role() == Role::Follower);
     CHECK_EQ(h.node->current_term(), Term{1});
@@ -256,10 +256,10 @@ TEST(raft_node_heartbeats_suppress_elections) {
 
 TEST(raft_node_rejects_stale_leader) {
     Harness h;
-    h.deliver(2, AppendEntries{3, 2, 0, 0, 0});
+    h.deliver(2, AppendEntries{3, 2, 0, 0, 0, {}});
     h.outbox.clear();
-    h.deliver(4, AppendEntries{2, 4, 0, 0, 0});
-    CHECK((h.take<AppendEntriesReply>().at(0).second == AppendEntriesReply{3, false}));
+    h.deliver(4, AppendEntries{2, 4, 0, 0, 0, {}});
+    CHECK((h.take<AppendEntriesReply>().at(0).second == AppendEntriesReply{3, false, 0, 0}));
     CHECK_EQ(h.node->leader_id(), std::optional<NodeId>{2});
 }
 
