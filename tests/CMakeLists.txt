@@ -8,6 +8,8 @@ add_executable(quorum_tests
   raft/node_test.cpp
   raft/replication_node_test.cpp
   raft/log_invariants_test.cpp
+  raft/replication_test.cpp
+  raft/replication_fuzz_test.cpp
   raft/election_test.cpp
   raft/election_fuzz_test.cpp
 )
