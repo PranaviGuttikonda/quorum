@@ -45,8 +45,8 @@ constexpr NodeId kScenarioNodes = 5;
 
 // Given: a busy cluster with loss, a partition and a crash/restart.
 // Approach: nodes reply to a random peer (drawn from a workload Rng forked from
-//           the seed), and nodes 1 and 3 also send on timers. Node 3 keeps
-//           sending while crashed. All inputs are seed-driven, so the whole
+//           the seed), and nodes 1, 2 and 3 also send on timers. Node 3
+//           keeps sending while crashed, and node 2 keeps probing it. All inputs are seed-driven, so the whole
 //           trace is a function of the seed.
 
 std::vector<TraceEvent> run_scenario(std::uint64_t seed) {
@@ -65,6 +65,7 @@ std::vector<TraceEvent> run_scenario(std::uint64_t seed) {
     for (Tick t = 0; t < 300; ++t) {
         if (t % 3 == 0) net.send(1, static_cast<NodeId>(workload.uniform(2, kScenarioNodes)), "ping");
         if (t % 7 == 0) net.send(3, 1, "tick");  // keeps sending while crashed
+        if (t % 5 == 0) net.send(2, 3, "probe");  // always traffic to the crashed node
         if (t == 60) net.partition({{1, 2}, {3, 4, 5}});
         if (t == 90) net.crash(3);
         if (t == 140) net.heal();
@@ -322,4 +323,86 @@ TEST(network_faults_do_not_shift_randomness_of_later_messages) {
     };
     CHECK(delays_after(false) == delays_after(true));
     CHECK_EQ(delays_after(true).size(), std::size_t{20});
+}
+
+TEST(network_duplicate_probability_is_validated) {
+    CHECK_THROWS(SimNetwork(1, NetworkConfig{.duplicate_probability = -0.1}));
+    CHECK_THROWS(SimNetwork(1, NetworkConfig{.duplicate_probability = 1.5}));
+}
+
+TEST(network_duplicates_arrive_twice_at_rate_q) {
+    Inbox inbox;
+    SimNetwork net = make_cluster(21, {.min_delay = 1, .max_delay = 10, .duplicate_probability = 0.2},
+                                  inbox, 2);
+    const int n = 20000;
+    for (int i = 0; i < n; ++i) net.send(1, 2, "m");
+    net.run_for(10);
+
+    const auto& s = net.stats();
+    const double rate = static_cast<double>(s.duplicated) / n;
+    CHECK(rate > 0.18 && rate < 0.22);
+    CHECK_EQ(s.delivered, static_cast<std::uint64_t>(n) + s.duplicated);
+    CHECK_EQ(inbox.count(2), static_cast<std::size_t>(s.delivered));
+
+    // Every id arrives once or twice, and twice exactly when duplicated.
+    std::map<MessageId, int> per_id;
+    for (const Message& m : inbox.got[2]) ++per_id[m.id];
+    CHECK_EQ(per_id.size(), static_cast<std::size_t>(n));
+    std::uint64_t twice = 0;
+    for (const auto& [id, k] : per_id) {
+        CHECK(k == 1 || k == 2);
+        twice += k == 2 ? 1 : 0;
+    }
+    CHECK_EQ(twice, s.duplicated);
+
+    // The two copies have independent delays, so they often differ.
+    std::map<MessageId, std::vector<Tick>> times;
+    for (const Message& m : inbox.got[2]) times[m.id].push_back(m.deliver_at);
+    int different = 0;
+    for (const auto& [id, ts] : times)
+        if (ts.size() == 2 && ts[0] != ts[1]) ++different;
+    CHECK(different > 0);
+}
+
+TEST(network_lost_messages_are_never_duplicated) {
+    Inbox inbox;
+    SimNetwork net = make_cluster(
+        22, {.drop_probability = 1.0, .duplicate_probability = 1.0}, inbox, 2);
+    for (int i = 0; i < 100; ++i) net.send(1, 2, "");
+    net.run_for(20);
+    CHECK_EQ(inbox.count(2), std::size_t{0});
+    CHECK_EQ(net.stats().duplicated, std::uint64_t{0});
+}
+
+TEST(network_duplicates_respect_crash_and_partition) {
+    Inbox inbox;
+    SimNetwork net = make_cluster(23, {.min_delay = 5, .max_delay = 5, .duplicate_probability = 1.0},
+                                  inbox, 3);
+    net.send(1, 2, "to-crashed");
+    net.send(1, 3, "to-partitioned");
+    net.crash(2);
+    net.partition({{1}, {2, 3}});
+    net.run_for(10);
+    CHECK_EQ(inbox.count(2), std::size_t{0});
+    CHECK_EQ(inbox.count(3), std::size_t{0});
+    CHECK_EQ(net.stats().dropped_receiver_down, std::uint64_t{2});  // both copies
+    CHECK_EQ(net.stats().dropped_partition, std::uint64_t{2});
+}
+
+TEST(network_trace_with_duplicates_is_reproducible) {
+    auto run = [](std::uint64_t seed) {
+        Inbox inbox;
+        SimNetwork net = make_cluster(
+            seed, {.min_delay = 1, .max_delay = 8, .drop_probability = 0.1, .duplicate_probability = 0.3},
+            inbox, 3);
+        for (int i = 0; i < 300; ++i) net.send(1 + i % 3, 1 + (i + 1) % 3, "x");
+        net.run_for(10);
+        return net.trace();
+    };
+    const auto a = run(5);
+    CHECK(a == run(5));
+    CHECK(!(a == run(6)));
+    bool saw_dup = false;
+    for (const auto& e : a) saw_dup |= e.kind == EventKind::Duplicate;
+    CHECK(saw_dup);
 }

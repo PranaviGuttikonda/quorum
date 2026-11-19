@@ -11,10 +11,12 @@ namespace quorum::sim {
 namespace {
 
 // Heap comparator: std::push_heap/pop_heap build a max-heap, so "greater"
-// gives a min-heap. Ids are unique, so the order is total and deterministic.
+// gives a min-heap. (id, copy) is unique, so the order is total and
+// deterministic.
 bool later(const auto& a, const auto& b) {
     if (a.msg.deliver_at != b.msg.deliver_at) return a.msg.deliver_at > b.msg.deliver_at;
-    return a.msg.id > b.msg.id;
+    if (a.msg.id != b.msg.id) return a.msg.id > b.msg.id;
+    return a.copy > b.copy;
 }
 
 }  // namespace
@@ -22,6 +24,7 @@ bool later(const auto& a, const auto& b) {
 const char* to_string(EventKind kind) {
     switch (kind) {
         case EventKind::Send: return "send";
+        case EventKind::Duplicate: return "duplicate";
         case EventKind::Drop: return "drop";
         case EventKind::Deliver: return "deliver";
     }
@@ -54,6 +57,8 @@ SimNetwork::SimNetwork(std::uint64_t seed, NetworkConfig config) : config_(confi
     // Written so that NaN fails too.
     if (!(config_.drop_probability >= 0.0 && config_.drop_probability <= 1.0))
         throw std::invalid_argument("NetworkConfig: drop_probability must be in [0, 1]");
+    if (!(config_.duplicate_probability >= 0.0 && config_.duplicate_probability <= 1.0))
+        throw std::invalid_argument("NetworkConfig: duplicate_probability must be in [0, 1]");
 }
 
 void SimNetwork::add_node(NodeId id, Handler handler) {
@@ -94,6 +99,8 @@ MessageId SimNetwork::send(NodeId from, NodeId to, std::string payload) {
 
     const Tick delay = rng_.uniform(config_.min_delay, config_.max_delay);
     const bool lost = rng_.bernoulli(config_.drop_probability);
+    const bool duplicated = rng_.bernoulli(config_.duplicate_probability);
+    const Tick copy_delay = rng_.uniform(config_.min_delay, config_.max_delay);
 
     Message m;
     m.id = next_id_++;
@@ -113,7 +120,15 @@ MessageId SimNetwork::send(NodeId from, NodeId to, std::string payload) {
     } else if (!can_reach(from, to)) {
         drop(m, DropReason::Partitioned);
     } else {
-        queue_.push_back(Pending{std::move(m), receiver.incarnation});
+        if (duplicated) {
+            ++stats_.duplicated;
+            record(EventKind::Duplicate, m, DropReason::None);
+            Message copy = m;
+            copy.deliver_at = copy.sent_at + copy_delay;
+            queue_.push_back(Pending{std::move(copy), receiver.incarnation, 1});
+            std::push_heap(queue_.begin(), queue_.end(), later<Pending, Pending>);
+        }
+        queue_.push_back(Pending{std::move(m), receiver.incarnation, 0});
         std::push_heap(queue_.begin(), queue_.end(), later<Pending, Pending>);
     }
     return next_id_ - 1;

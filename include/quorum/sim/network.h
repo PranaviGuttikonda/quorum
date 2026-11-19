@@ -24,7 +24,8 @@ using MessageId = std::uint64_t;
 struct NetworkConfig {
     Tick min_delay = 1;  // must be >= 1: nothing arrives in the tick it was sent
     Tick max_delay = 10;
-    double drop_probability = 0.0;  // in [0, 1]
+    double drop_probability = 0.0;       // in [0, 1]
+    double duplicate_probability = 0.0;  // in [0, 1]: a delivered message arrives twice
 };
 
 struct Message {
@@ -44,7 +45,9 @@ enum class DropReason : std::uint8_t {
     ReceiverDown,  // receiver crashed, or restarted since the message was sent
 };
 
-enum class EventKind : std::uint8_t { Send, Drop, Deliver };
+// Duplicate is recorded at send time when a second copy is scheduled. Both
+// copies then get their own Deliver or Drop event.
+enum class EventKind : std::uint8_t { Send, Duplicate, Drop, Deliver };
 
 struct TraceEvent {
     Tick tick = 0;
@@ -59,6 +62,7 @@ struct TraceEvent {
 
 struct NetworkStats {
     std::uint64_t sent = 0;
+    std::uint64_t duplicated = 0;
     std::uint64_t delivered = 0;
     std::uint64_t dropped_random = 0;
     std::uint64_t dropped_partition = 0;
@@ -85,9 +89,12 @@ public:
     void add_node(NodeId id, Handler handler);
 
     // Given: a message from `from` to `to`.
-    // Approach: always draw the delay and the loss decision, then apply the
-    //           faults. RNG consumption per send stays constant, so a partition
-    //           or crash doesn't shift the randomness of later messages.
+    // Approach: always draw the delay, the loss decision, the duplicate
+    //           decision and the copy's delay, then apply the faults. RNG
+    //           consumption per send stays constant, so a partition or crash
+    //           doesn't shift the randomness of later messages. A duplicate is
+    //           an independent second copy with its own delay, so it can arrive
+    //           before the original. A lost message has no copies.
     // Throws if either node is unknown. Returns the message id.
     MessageId send(NodeId from, NodeId to, std::string payload);
 
@@ -132,6 +139,7 @@ private:
     struct Pending {
         Message msg;
         std::uint64_t receiver_incarnation = 0;
+        std::uint8_t copy = 0;  // 0 = original, 1 = duplicate; tie-break for the heap
     };
 
     Node& node(NodeId id);
@@ -143,7 +151,7 @@ private:
     Rng rng_;
     SimClock clock_;
     std::map<NodeId, Node> nodes_;  // ordered: iteration is deterministic
-    std::vector<Pending> queue_;    // min-heap on (deliver_at, id)
+    std::vector<Pending> queue_;    // min-heap on (deliver_at, id, copy)
     MessageId next_id_ = 1;
     std::vector<TraceEvent> trace_;
     NetworkStats stats_;
