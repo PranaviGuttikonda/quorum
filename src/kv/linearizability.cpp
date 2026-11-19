@@ -85,17 +85,25 @@ std::vector<Event> build_events(const std::vector<SearchOp>& ops) {
 
 // --- Memoization -----------------------------------------------------------
 
+// The memo key. The state is stored flat (present + value, with an absent
+// value always ""), not as std::optional<std::string>: GCC's
+// -Wmaybe-uninitialized misfires on copied optional strings at -O2.
 struct Config {
     std::vector<std::uint64_t> bits;  // which ops are linearized
-    std::optional<std::string> state;
+    bool present = false;
+    std::string value;
     bool operator==(const Config&) const = default;
 };
+
+Config make_config(const std::vector<std::uint64_t>& bits, const std::optional<std::string>& state) {
+    return Config{bits, state.has_value(), state.value_or(std::string())};
+}
 
 struct ConfigHash {
     std::size_t operator()(const Config& c) const {
         std::uint64_t h = 0x9e3779b97f4a7c15ULL;
         for (std::uint64_t w : c.bits) h = (h ^ w) * 0x100000001b3ULL;
-        h ^= c.state ? std::hash<std::string>{}(*c.state) : 0x5bd1e995ULL;
+        h ^= c.present ? std::hash<std::string>{}(c.value) : 0x5bd1e995ULL;
         return static_cast<std::size_t>(h ^ (h >> 29));
     }
 };
@@ -144,7 +152,10 @@ SearchResult search(const std::vector<SearchOp>& ops, std::uint64_t max_states,
     std::size_t remaining = 0;
     for (const SearchOp& o : ops) remaining += o.completed ? 1 : 0;
     const std::size_t words = (ops.size() + 63) / 64;
-    Config cur{std::vector<std::uint64_t>(words, 0), std::nullopt};
+    struct {
+        std::vector<std::uint64_t> bits;
+        std::optional<std::string> state;
+    } cur{std::vector<std::uint64_t>(words, 0), std::nullopt};
     std::unordered_set<Config, ConfigHash> seen;
     struct Frame {
         int entry;
@@ -171,8 +182,7 @@ SearchResult search(const std::vector<SearchOp>& ops, std::uint64_t max_states,
             const bool fits = !o.completed || o.wildcard || st.result == *o.result;
             if (fits) {
                 cur.bits[i / 64] |= std::uint64_t{1} << (i % 64);
-                Config key{cur.bits, st.next};
-                if (seen.insert(std::move(key)).second) {
+                if (seen.insert(make_config(cur.bits, st.next)).second) {
                     if (++out.states > max_states) {
                         out.outcome = Outcome::Unknown;
                         return out;
