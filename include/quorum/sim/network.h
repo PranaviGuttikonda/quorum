@@ -107,6 +107,12 @@ public:
     void heal();
     bool can_reach(NodeId from, NodeId to) const;
 
+    // Given: some nodes (simulated clients) sit outside the partition model.
+    // Approach: a global node reaches, and is reached by, every group.
+    //           Turning the flag off puts it back under normal partition
+    //           rules.
+    void set_global(NodeId id, bool global);
+
     // Given: a crashed node must receive nothing, including messages already in
     //        flight to it.
     // Approach: each crash bumps the node's incarnation. A message records its
@@ -134,6 +140,7 @@ private:
         bool up = true;
         std::uint64_t incarnation = 0;
         std::uint32_t group = 0;
+        bool global = false;
     };
 
     struct Pending {

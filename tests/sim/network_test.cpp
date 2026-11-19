@@ -406,3 +406,22 @@ TEST(network_trace_with_duplicates_is_reproducible) {
     for (const auto& e : a) saw_dup |= e.kind == EventKind::Duplicate;
     CHECK(saw_dup);
 }
+
+TEST(network_global_nodes_reach_every_partition_group) {
+    Inbox inbox;
+    SimNetwork net = make_cluster(31, {}, inbox, 4);
+    net.set_global(4, true);
+    net.partition({{1}, {2, 3}});
+    CHECK(net.can_reach(4, 1) && net.can_reach(4, 2) && net.can_reach(1, 4) && net.can_reach(3, 4));
+    CHECK(!net.can_reach(1, 2));
+    net.send(4, 1, "hi");
+    net.send(2, 4, "hi");
+    net.run_for(20);
+    CHECK_EQ(inbox.count(1), std::size_t{1});
+    CHECK_EQ(inbox.count(4), std::size_t{1});
+
+    net.set_global(4, false);  // back under the rules: unlisted, so its own group
+    CHECK(!net.can_reach(4, 1));
+    CHECK(!net.can_reach(2, 4));
+    CHECK_THROWS(net.set_global(9, true));
+}

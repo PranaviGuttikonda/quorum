@@ -157,7 +157,13 @@ void SimNetwork::heal() {
 }
 
 bool SimNetwork::can_reach(NodeId from, NodeId to) const {
-    return node(from).group == node(to).group;
+    const Node& a = node(from);
+    const Node& b = node(to);
+    return a.global || b.global || a.group == b.group;
+}
+
+void SimNetwork::set_global(NodeId id, bool global) {
+    node(id).global = global;
 }
 
 void SimNetwork::crash(NodeId id) {

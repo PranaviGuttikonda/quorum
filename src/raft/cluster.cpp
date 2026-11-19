@@ -10,8 +10,8 @@ namespace quorum::raft {
 //           stream per node. Each boot of a node forks again from its parent,
 //           so a restarted node gets fresh but reproducible timeouts.
 RaftCluster::RaftCluster(std::uint64_t seed, std::size_t size, RaftConfig raft,
-                         sim::NetworkConfig net)
-    : raft_config_(raft), net_(sim::Rng(seed).next_u64(), net) {
+                         sim::NetworkConfig net, ServiceFactory services)
+    : raft_config_(raft), net_(sim::Rng(seed).next_u64(), net), service_factory_(std::move(services)) {
     if (size == 0) throw std::invalid_argument("RaftCluster: size must be >= 1");
     validate(raft_config_);
     sim::Rng root(seed);
@@ -21,10 +21,16 @@ RaftCluster::RaftCluster(std::uint64_t seed, std::size_t size, RaftConfig raft,
     for (NodeId id : ids_) {
         storage_.emplace(id, std::make_unique<MemoryStorage>());
         node_rngs_.emplace(id, root.fork());
+        services_[id];
         net_.add_node(id, [this, id](const sim::Message& m) {
             // SimNetwork never delivers to a crashed node, but stay defensive.
-            if (auto it = nodes_.find(id); it != nodes_.end() && it->second)
+            auto it = nodes_.find(id);
+            if (it == nodes_.end() || !it->second) return;
+            if (is_server(m.from)) {
                 it->second->receive(m.from, m.payload);
+            } else if (const auto& svc = services_.at(id)) {
+                svc->on_client_message(m.from, m.payload);
+            }
         });
     }
     for (NodeId id : ids_) boot(id);
@@ -40,12 +46,25 @@ void RaftCluster::boot(NodeId id) {
         if (index != applied.size() + 1)
             throw std::logic_error("RaftCluster: node applied out of order");
         applied.push_back(entry);
+        if (const auto& svc = services_.at(id)) svc->on_apply(index, entry);
     };
     applied_[id].clear();
     ++boots_[id];
     nodes_[id] = std::make_unique<RaftNode>(id, std::move(peers), raft_config_, *storage_.at(id),
-                                            std::move(send), node_rngs_.at(id).fork(),
-                                            std::move(apply));
+                                            send, node_rngs_.at(id).fork(), std::move(apply));
+    if (service_factory_) services_[id] = service_factory_(id, *nodes_[id], send);
+}
+
+void RaftCluster::add_client(NodeId id, std::function<void(const sim::Message&)> handler) {
+    if (is_server(id)) throw std::invalid_argument("RaftCluster::add_client: id is a server");
+    net_.add_node(id, std::move(handler));
+    net_.set_global(id, true);
+    clients_.insert(id);
+}
+
+void RaftCluster::client_send(NodeId from, NodeId to, std::string payload) {
+    if (!clients_.count(from)) throw std::invalid_argument("RaftCluster::client_send: not a client");
+    net_.send(from, to, std::move(payload));
 }
 
 void RaftCluster::tick() {
@@ -81,6 +100,7 @@ void RaftCluster::crash(NodeId id) {
     auto& n = nodes_.at(id);
     if (!n) return;
     net_.crash(id);
+    services_.at(id).reset();  // it may refer to the node
     n.reset();
 }
 

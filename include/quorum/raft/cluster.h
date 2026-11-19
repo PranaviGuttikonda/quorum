@@ -10,16 +10,23 @@
 //           recorded and asserted to arrive in index order. The record
 //           restarts with the node, because the state machine is volatile
 //           and is rebuilt from the log.
+//
+//           Servers are nodes 1..size. With a ServiceFactory, each boot also
+//           creates a Service beside the node. Messages from servers go to
+//           Raft, and messages from anyone else (clients) go to the Service.
+//           Clients are global network nodes: partitions only split servers.
 
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "quorum/raft/node.h"
+#include "quorum/raft/service.h"
 #include "quorum/raft/storage.h"
 #include "quorum/sim/network.h"
 #include "quorum/sim/rng.h"
@@ -32,7 +39,7 @@ public:
 
     // Nodes are numbered 1..size.
     RaftCluster(std::uint64_t seed, std::size_t size, RaftConfig raft = {},
-                sim::NetworkConfig net = {});
+                sim::NetworkConfig net = {}, ServiceFactory services = {});
 
     RaftCluster(const RaftCluster&) = delete;
     RaftCluster& operator=(const RaftCluster&) = delete;
@@ -55,9 +62,19 @@ public:
 
     void partition(const std::vector<std::vector<NodeId>>& groups) { net_.partition(groups); }
     void heal() { net_.heal(); }
+    // Takes a node in or out of the partition model (clients start global).
+    void set_global(NodeId id, bool global) { net_.set_global(id, global); }
+
+    // Registers a client node. Its id must not be a server id. It starts global.
+    void add_client(NodeId id, std::function<void(const sim::Message&)> handler);
+    // Sends from a registered client.
+    void client_send(NodeId from, NodeId to, std::string payload);
+    bool is_server(NodeId id) const { return id >= 1 && id <= ids_.size(); }
 
     // Null while the node is crashed.
     const RaftNode* node(NodeId id) const;
+    // Null while crashed, or when there is no ServiceFactory.
+    const Service* service(NodeId id) const { return services_.at(id).get(); }
     const std::vector<NodeId>& ids() const { return ids_; }
     Tick now() const { return net_.now(); }
     const sim::SimNetwork& network() const { return net_; }
@@ -81,7 +98,10 @@ private:
     std::vector<NodeId> ids_;
     std::map<NodeId, std::unique_ptr<MemoryStorage>> storage_;
     std::map<NodeId, sim::Rng> node_rngs_;  // parent stream per node, forked per boot
+    ServiceFactory service_factory_;
     std::map<NodeId, std::unique_ptr<RaftNode>> nodes_;
+    std::map<NodeId, std::unique_ptr<Service>> services_;  // destroyed before nodes_
+    std::set<NodeId> clients_;
     std::map<NodeId, std::vector<LogEntry>> applied_;
     std::map<NodeId, std::uint64_t> boots_;
     std::vector<Observer> observers_;
