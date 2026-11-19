@@ -8,9 +8,14 @@
 //   - general: clients write to random nodes and follow leader hints.
 //   - nemesis: writes go to every node that believes it leads, so stale
 //     leaders build up divergent suffixes.
+//   Each schedule also runs on FileStorage over SimDisk (sim_disks.h): every
+//   crash is a power loss that drops or tears unsynced writes, and some land
+//   partway through a disk call.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -43,6 +48,7 @@ struct Profile {
     // Instead of one client write to a random node, hand each write to every
     // live node that believes it leads, stale leaders included.
     bool propose_to_all_leaders = false;
+    bool disks = false;  // FileStorage on SimDisk, with disk crash faults
 };
 
 struct FuzzResult {
@@ -54,6 +60,7 @@ struct FuzzResult {
     std::uint64_t crashes = 0;
     std::uint64_t partitions = 0;
     Tick settle_ticks = 0;
+    quorum::testing::DiskTotals disk;
 };
 
 // A client: try a random live node, and follow one leader hint.
@@ -79,7 +86,8 @@ bool converged(const RaftCluster& c) {
 }
 
 FuzzResult run_seed(std::uint64_t seed, const Profile& p = {}) {
-    RaftCluster c(seed, p.faults.nodes, {}, p.faults.net);
+    auto disks = p.disks ? std::make_shared<quorum::testing::SimDisks>(seed) : nullptr;
+    RaftCluster c(seed, p.faults.nodes, {}, p.faults.net, {}, disks);
     ElectionSafetyChecker election;
     LogSafetyChecker logs;
     c.add_observer([&](const RaftCluster& cl) {
@@ -88,6 +96,7 @@ FuzzResult run_seed(std::uint64_t seed, const Profile& p = {}) {
     });
 
     FaultInjector faults(p.faults, seed);
+    if (disks) faults.use_disks(*disks);
     Rng clients(seed ^ 0xc11e47c11e47c11eULL);
     FuzzResult r;
     std::uint64_t next_cmd = 0;
@@ -142,6 +151,7 @@ FuzzResult run_seed(std::uint64_t seed, const Profile& p = {}) {
     r.partitions = faults.partitions;
     for (NodeId id : c.ids()) r.truncated += c.truncated_entries(id);
     r.duplicated = c.network().stats().duplicated;
+    if (disks) r.disk = disks->totals();
     return r;
 }
 
@@ -214,4 +224,56 @@ TEST(replication_fuzz_nemesis_across_seeds) {
     CHECK(total.truncated > 2 * seeds());
     CHECK(total.crashes > 8 * seeds());
     CHECK(total.partitions > 25 * seeds());
+}
+
+// Given: the same schedules, with every node on FileStorage over a SimDisk.
+// Approach: the same checks, plus floors showing the disk faults really
+//           happened: unsynced writes lost, torn tails recovered, crashes
+//           partway through a disk call.
+void run_on_disk(const char* name, Profile p) {
+    p.disks = true;
+    FuzzResult total;
+    for (std::uint64_t seed = 1; seed <= seeds(); ++seed) {
+        const FuzzResult r = run_seed(seed, p);
+        if (!r.failure.empty())
+            quorum::test::fail(__FILE__, __LINE__,
+                               std::string(name) + " seed " + std::to_string(seed) + ": " + r.failure);
+        total.committed += r.committed;
+        total.crashes += r.crashes;
+        total.disk += r.disk;
+    }
+    const auto& d = total.disk;
+    std::printf("replication fuzz %s on disk: %llu seeds, %llu committed, %llu power losses "
+                "(%llu mid-call), %llu unsynced writes lost, %llu kept, %llu torn writes, "
+                "%llu torn tails recovered\n",
+                name, (unsigned long long)seeds(), (unsigned long long)total.committed,
+                (unsigned long long)d.power_losses, (unsigned long long)d.mid_call_crashes,
+                (unsigned long long)d.unsynced_ops_lost, (unsigned long long)d.unsynced_ops_kept,
+                (unsigned long long)d.torn_writes, (unsigned long long)d.torn_tails);
+    CHECK(total.committed > 30 * seeds());
+    CHECK(d.mid_call_crashes > 5 * seeds());
+    CHECK(d.unsynced_ops_lost > seeds());
+    CHECK(d.torn_tails > seeds() / 4);
+}
+
+TEST(replication_fuzz_on_disk_across_seeds) {
+    run_on_disk("general", Profile{});
+}
+
+TEST(replication_fuzz_nemesis_on_disk_across_seeds) {
+    run_on_disk("nemesis", nemesis());
+}
+
+TEST(replication_fuzz_on_disk_is_reproducible) {
+    Profile p;
+    p.disks = true;
+    for (std::uint64_t seed : {7ULL, 70ULL}) {
+        const FuzzResult a = run_seed(seed, p);
+        const FuzzResult b = run_seed(seed, p);
+        CHECK(a.failure.empty());
+        CHECK_EQ(a.committed, b.committed);
+        CHECK_EQ(a.disk.torn_writes, b.disk.torn_writes);
+        CHECK_EQ(a.disk.unsynced_ops_lost, b.disk.unsynced_ops_lost);
+        CHECK_EQ(a.settle_ticks, b.settle_ticks);
+    }
 }

@@ -15,12 +15,15 @@
 //   - replaying the leader's log into a fresh state machine rebuilds the
 //     same state (sessions included).
 //   Faults include clients being pulled into partitions, so a client can be
-//   stuck with a minority leader.
+//   stuck with a minority leader. Each schedule also runs on FileStorage over
+//   SimDisk, where every crash is a power loss and some land partway through
+//   a disk call.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -62,6 +65,7 @@ struct FuzzResult {
     std::uint64_t crashes = 0;
     std::uint64_t partitions = 0;
     Tick settle_ticks = 0;
+    quorum::testing::DiskTotals disk;
 };
 
 void submit_random(KvClient& c, Rng& rng) {
@@ -142,8 +146,10 @@ std::string check_final_state(const KvCluster& k) {
     return {};
 }
 
-FuzzResult run_seed(std::uint64_t seed, const FaultProfile& p) {
+FuzzResult run_seed(std::uint64_t seed, const FaultProfile& p, bool on_disk = false) {
+    auto disks = on_disk ? std::make_shared<quorum::testing::SimDisks>(seed) : nullptr;
     KvClusterConfig cfg;
+    cfg.storage = disks;
     cfg.servers = p.nodes;
     cfg.clients = 3;
     cfg.net = p.net;
@@ -157,6 +163,7 @@ FuzzResult run_seed(std::uint64_t seed, const FaultProfile& p) {
     auto failed = [&] { return !election.ok() || !logs.ok(); };
 
     FaultInjector faults(p, seed);
+    if (disks) faults.use_disks(*disks);
     Rng work(seed ^ 0x3c3c3c3c5a5a5a5aULL);
     FuzzResult r;
     try {
@@ -196,13 +203,14 @@ FuzzResult run_seed(std::uint64_t seed, const FaultProfile& p) {
     r.crashes = faults.crashes;
     r.partitions = faults.partitions;
     r.clients_partitioned = faults.clients_partitioned;
+    if (disks) r.disk = disks->totals();
     return r;
 }
 
-FuzzResult run_all(const FaultProfile& p, const char* name) {
+FuzzResult run_all(const FaultProfile& p, const char* name, bool on_disk = false) {
     FuzzResult total;
     for (std::uint64_t seed = 1; seed <= seeds(); ++seed) {
-        const FuzzResult r = run_seed(seed, p);
+        const FuzzResult r = run_seed(seed, p, on_disk);
         if (!r.failure.empty())
             quorum::test::fail(__FILE__, __LINE__,
                                std::string(name) + " seed " + std::to_string(seed) + ": " + r.failure);
@@ -217,6 +225,7 @@ FuzzResult run_all(const FaultProfile& p, const char* name) {
         total.unknown += r.unknown;
         total.max_states = std::max(total.max_states, r.max_states);
         total.clients_partitioned += r.clients_partitioned;
+        total.disk += r.disk;
     }
     std::printf("kv fuzz %s: %llu seeds, %llu ops checked for linearizability, %llu unknown, "
                 "largest per-key search %llu states, %llu client partitionings\n",
@@ -224,6 +233,14 @@ FuzzResult run_all(const FaultProfile& p, const char* name) {
                 static_cast<unsigned long long>(total.checked_ops), static_cast<unsigned long long>(total.unknown),
                 static_cast<unsigned long long>(total.max_states),
                 static_cast<unsigned long long>(total.clients_partitioned));
+    if (on_disk) {
+        const auto& d = total.disk;
+        std::printf("kv fuzz %s: %llu power losses (%llu mid-call), %llu unsynced writes lost, "
+                    "%llu kept, %llu torn writes, %llu torn tails recovered\n",
+                    name, (unsigned long long)d.power_losses, (unsigned long long)d.mid_call_crashes,
+                    (unsigned long long)d.unsynced_ops_lost, (unsigned long long)d.unsynced_ops_kept,
+                    (unsigned long long)d.torn_writes, (unsigned long long)d.torn_tails);
+    }
     return total;
 }
 
@@ -270,4 +287,25 @@ TEST(kv_fuzz_is_reproducible) {
         CHECK_EQ(a.deduplicated, b.deduplicated);
         CHECK_EQ(a.settle_ticks, b.settle_ticks);
     }
+}
+
+// Given: the same schedules on FileStorage over SimDisk.
+// Approach: the same checks (linearizability included), plus floors showing
+//           the disk faults happened.
+TEST(kv_fuzz_general_on_disk_across_seeds) {
+    const FuzzResult t = run_all(with_client_partitions(FaultProfile::general()), "general on disk", true);
+    CHECK(t.completed > 75 * seeds());
+    CHECK_EQ(t.unknown, std::uint64_t{0});
+    CHECK(t.disk.mid_call_crashes > 5 * seeds());
+    CHECK(t.disk.unsynced_ops_lost > seeds());
+    CHECK(t.disk.torn_tails > seeds() / 4);
+}
+
+TEST(kv_fuzz_nemesis_on_disk_across_seeds) {
+    const FuzzResult t = run_all(with_client_partitions(FaultProfile::nemesis()), "nemesis on disk", true);
+    CHECK(t.completed > 40 * seeds());
+    CHECK_EQ(t.unknown, std::uint64_t{0});
+    CHECK(t.disk.mid_call_crashes > 5 * seeds());
+    CHECK(t.disk.unsynced_ops_lost > seeds());
+    CHECK(t.disk.torn_tails > seeds() / 4);
 }

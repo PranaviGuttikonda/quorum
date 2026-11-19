@@ -15,6 +15,10 @@
 //     puts it on the leader's side, so it is stuck with a minority leader;
 //     a random split puts it on a random side. A heal makes every client
 //     global again.
+//   - disk_crash: only with SimDisks attached (use_disks). Per tick, a random
+//     live node's disk loses power partway through one of its next 8 calls.
+//     Its draws are skipped without disks, so memory-storage schedules are
+//     unchanged.
 
 #include <cstdint>
 #include <optional>
@@ -24,6 +28,7 @@
 
 #include "quorum/raft/cluster.h"
 #include "quorum/sim/rng.h"
+#include "sim_disks.h"
 
 namespace quorum::testing {
 
@@ -40,6 +45,7 @@ struct FaultProfile {
     double isolate_leader = 0.0;    // cut the newest leader off alone
     double heal = 0.004;
     double client_partition = 0.0;  // per client, per partition event
+    double disk_crash = 0.004;      // per tick, with SimDisks attached
     std::size_t nodes = 5;
     std::size_t max_down = 2;
     sim::NetworkConfig net{
@@ -80,6 +86,8 @@ public:
     FaultInjector(const FaultProfile& p, std::uint64_t seed)
         : p_(p), rng_(seed ^ 0xfa017fa017fa017fULL) {}
 
+    void use_disks(SimDisks& disks) { disks_ = &disks; }
+
     // Applies the faults for tick `t`. Call it before the cluster ticks.
     void step(RaftCluster& c, Tick t) {
         // A nemesis that targets the window right after an election: the new
@@ -111,6 +119,15 @@ public:
         }
         for (NodeId id : down_ids)
             if (rng_.bernoulli(p_.restart)) c.restart(id);
+        if (disks_ && down_ids.size() < p_.max_down && rng_.bernoulli(p_.disk_crash)) {
+            std::vector<NodeId> live;
+            for (NodeId id : c.ids())
+                if (c.is_up(id)) live.push_back(id);
+            if (!live.empty()) {
+                disks_->arm(live[rng_.uniform(0, live.size() - 1)], rng_);
+                ++disk_crashes_armed;
+            }
+        }
 
         // Cutting off the newest leader may replace an existing partition, for
         // example isolating a new majority leader while the previous one is
@@ -142,15 +159,18 @@ public:
         }
     }
 
-    // Heals the network and restarts every crashed node.
+    // Heals the network, cancels pending disk crashes and restarts every
+    // crashed node.
     void clear(RaftCluster& c) {
         heal(c);
+        if (disks_) disks_->disarm_all();
         for (NodeId id : c.ids()) c.restart(id);
     }
 
     std::uint64_t crashes = 0;
     std::uint64_t partitions = 0;
     std::uint64_t clients_partitioned = 0;
+    std::uint64_t disk_crashes_armed = 0;
 
 private:
     void heal(RaftCluster& c) {
@@ -182,6 +202,7 @@ private:
 
     FaultProfile p_;
     sim::Rng rng_;
+    SimDisks* disks_ = nullptr;
     bool partitioned_ = false;
     std::set<std::pair<NodeId, Term>> seen_leaders_;
     std::vector<std::pair<Tick, std::pair<NodeId, Term>>> doomed_;
