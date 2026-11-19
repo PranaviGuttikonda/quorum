@@ -274,6 +274,36 @@ bool changes_nothing(const SearchOp& o) {
     return false;
 }
 
+// a happened before b in real time (a's reply came no later than b's invoke).
+bool precedes(const SearchOp& a, const SearchOp& b) {
+    return a.completed && *a.completed <= b.invoked;
+}
+
+bool observes(const SearchOp& o) {
+    // Its result depends on the key's value. A plain put's doesn't.
+    return o.command.op != Op::Put;
+}
+
+// Given: a write W, and a completed put P that started after W finished.
+// Approach: if no operation that observes the key overlaps the span from W to
+//           P (each one ends before W starts or starts after P ends), nobody
+//           can ever see W's effect. In any linearization, removing W changes
+//           no result, so removing it can't create a failure.
+bool superseded(const std::vector<SearchOp>& ops, std::size_t w) {
+    if (ops[w].command.op == Op::Get) return false;
+    for (std::size_t p = 0; p < ops.size(); ++p) {
+        if (p == w || ops[p].command.op != Op::Put || !ops[p].completed || !precedes(ops[w], ops[p])) continue;
+        bool hidden = true;
+        for (std::size_t o = 0; o < ops.size() && hidden; ++o) {
+            if (o == w || o == p || !observes(ops[o])) continue;
+            if (!ops[o].completed) continue;  // no result to constrain; its effect is overwritten by P
+            hidden = precedes(ops[o], ops[w]) || precedes(ops[p], ops[o]);
+        }
+        if (hidden) return true;
+    }
+    return false;
+}
+
 std::string explain(const std::string& key, const std::vector<SearchOp>& ops, std::uint64_t max_states) {
     // 1. Shortest failing real-time prefix: at each reply, in event order,
     //    take the ops already invoked. Those not yet answered become
@@ -314,20 +344,35 @@ std::string explain(const std::string& key, const std::vector<SearchOp>& ops, st
     }
     if (!located) return "no failing prefix found (the full history fails only as a whole)";
 
-    // 2. Drop every op that can't have changed the key, if the rest still fails.
-    for (std::size_t i = 0; i < prefix.size();) {
-        if (i == culprit || !changes_nothing(prefix[i])) {
-            ++i;
-            continue;
-        }
-        std::vector<SearchOp> without = prefix;
-        without.erase(without.begin() + static_cast<std::ptrdiff_t>(i));
-        const std::size_t c = culprit > i ? culprit - 1 : culprit;
-        if (search(without, max_states).outcome == Outcome::Fail) {
-            prefix = std::move(without);
-            culprit = c;
-        } else {
-            ++i;
+    // 2. Drop operations whose removal can't create a failure (ones that
+    //    leave the key unchanged, and writes nobody could observe) for as long
+    //    as the rest still fails. Repeat until nothing more can go. For
+    //    readability, keep the write of the value the culprit actually
+    //    returned, so a stale read still shows where its value came from.
+    const std::optional<std::string> culprit_saw =
+        prefix[culprit].result ? prefix[culprit].result->value : std::nullopt;
+    auto wrote_what_culprit_saw = [&](const SearchOp& o) {
+        return culprit_saw && (o.command.op == Op::Put || o.command.op == Op::Cas) && o.command.value == *culprit_saw;
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (std::size_t i = 0; i < prefix.size();) {
+            const bool removable =
+                changes_nothing(prefix[i]) || (superseded(prefix, i) && !wrote_what_culprit_saw(prefix[i]));
+            if (i == culprit || !removable) {
+                ++i;
+                continue;
+            }
+            std::vector<SearchOp> without = prefix;
+            without.erase(without.begin() + static_cast<std::ptrdiff_t>(i));
+            const std::size_t c = culprit > i ? culprit - 1 : culprit;
+            if (search(without, max_states).outcome == Outcome::Fail) {
+                prefix = std::move(without);
+                culprit = c;
+                changed = true;
+            } else {
+                ++i;
+            }
         }
     }
 

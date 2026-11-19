@@ -244,3 +244,20 @@ TEST(lin_model_matches_the_state_machine) {
         CHECK((state == (it == sm.data().end() ? absent : some(it->second))));
     }
 }
+
+TEST(lin_explanation_drops_overwritten_writes_but_keeps_observed_ones) {
+    // put a, put b (unobserved, overwritten by put c), put c, stale get -> b.
+    H h;
+    h.put(1, "k", "a", 0, 10).put(1, "k", "b", 20, 30).put(1, "k", "c", 40, 50).get(2, "k", some("b"), 60, 70);
+    const CheckResult r = check_linearizable(h.ops);
+    CHECK(r.verdict == Verdict::NotLinearizable);
+    CHECK(!mentions(r, "put(\"a\")"));  // overwritten before anyone could look
+    CHECK(mentions(r, "put(\"c\")") && mentions(r, "put(\"b\")"));
+    // A write that someone observed must stay, even though a later put overwrote it.
+    H seen;
+    seen.put(1, "k", "a", 0, 10).get(3, "k", some("a"), 12, 18).put(1, "k", "b", 20, 30);
+    seen.get(2, "k", some("a"), 40, 50);
+    const CheckResult r2 = check_linearizable(seen.ops);
+    CHECK(r2.verdict == Verdict::NotLinearizable);
+    CHECK(mentions(r2, "put(\"a\")") && mentions(r2, "put(\"b\")"));
+}

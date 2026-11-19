@@ -26,8 +26,10 @@
 //       1. the culprit, which is the operation completing at the end of the
 //          shortest real-time prefix that is already non-linearizable
 //          (linearizability is prefix-closed, so that is sound);
-//       2. only the operations needed to keep that prefix failing, dropping
-//          those that can't change the key's state, which is always safe;
+//       2. only the operations needed to keep that prefix failing. It drops
+//          those that can't change the key, and writes overwritten by a later
+//          put before anything could observe them. Removing either kind can
+//          never create a failure, so what remains is a true witness;
 //       3. the values the key could hold whenever the culprit could take
 //          effect.
 
