@@ -4,17 +4,22 @@
 //           random put/get/delete/cas operations on a few hot keys, with the
 //           Raft safety checkers on every tick. After the faults stop, every
 //           client finishes its outstanding operation. Then:
+//   - the whole history is linearizable (checked per key), and any
+//     "unknown" verdict is counted and must be zero;
 //   - every replica holds the same KV map, session table and execution
 //     record;
-//   - every operation in the history executed exactly once: none lost,
-//     none applied twice;
-//   - each client's reply equals the result of its single execution in log
-//     order;
+//   - every write in the history executed exactly once: none lost, none
+//     applied twice. Each writer's reply equals the result of that single
+//     execution. Reads aren't required to touch the log: their results are
+//     judged by the linearizability checker alone;
 //   - replaying the leader's log into a fresh state machine rebuilds the
 //     same state (sessions included).
+//   Faults include clients being pulled into partitions, so a client can be
+//   stuck with a minority leader.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <optional>
 #include <string>
@@ -25,6 +30,7 @@
 #include "fuzz_seeds.h"
 #include "harness.h"
 #include "quorum/kv/cluster.h"
+#include "quorum/kv/linearizability.h"
 #include "quorum/raft/invariants.h"
 
 using namespace quorum::kv;
@@ -45,6 +51,10 @@ constexpr double kOpRate = 0.3;  // per idle client per tick
 
 struct FuzzResult {
     std::string failure;
+    std::uint64_t checked_ops = 0;     // operations given to the linearizability checker
+    std::uint64_t unknown = 0;         // histories the checker couldn't decide within its bound
+    std::uint64_t max_states = 0;      // largest per-key search, against a 1M bound
+    std::uint64_t clients_partitioned = 0;
     std::uint64_t completed = 0;
     std::uint64_t timeouts = 0;
     std::uint64_t redirects = 0;
@@ -95,15 +105,18 @@ std::string check_final_state(const KvCluster& k) {
             return "node " + std::to_string(id) + " executed a different sequence";
     }
 
-    // Exactly once: index every execution by (client, seq).
+    // Exactly once, for writes: index every execution by (client, seq).
     std::map<std::pair<ClientId, Seq>, const Execution*> executed;
     for (const Execution& e : ref.executions())
         if (!executed.emplace(std::make_pair(e.command.client, e.command.seq), &e).second)
             return "client " + std::to_string(e.command.client) + " seq " + std::to_string(e.command.seq) +
                    " executed twice";
+    std::map<std::pair<ClientId, Seq>, const OpRecord*> by_seq;
     for (const OpRecord& op : k.history().ops()) {
         const auto key = std::make_pair(op.command.client, op.command.seq);
+        by_seq.emplace(key, &op);
         if (!op.completed) return "an operation never completed";
+        if (!op.command.is_write()) continue;  // reads: judged by the linearizability checker
         const auto it = executed.find(key);
         if (it == executed.end())
             return "completed " + std::string(to_string(op.command.op)) + " by client " +
@@ -113,7 +126,11 @@ std::string check_final_state(const KvCluster& k) {
             return "client " + std::to_string(key.first) + " seq " + std::to_string(key.second) +
                    " got a reply that differs from its execution";
     }
-    if (executed.size() != k.history().ops().size()) return "an execution with no client operation";
+    for (const auto& [key, e] : executed) {
+        const auto it = by_seq.find(key);
+        if (it == by_seq.end() || !(it->second->command == e->command))
+            return "an execution with no matching client operation";
+    }
 
     // Deterministic rebuild from the log alone.
     KvStateMachine replay;
@@ -157,7 +174,14 @@ FuzzResult run_seed(std::uint64_t seed, const FaultProfile& p) {
         if (!election.ok()) r.failure = *election.violation();
         else if (!logs.ok()) r.failure = *logs.violation();
         else if (!settled(k)) r.failure = "did not settle within " + std::to_string(kSettleBound) + " ticks";
-        else r.failure = check_final_state(k);
+        if (r.failure.empty()) {
+            const CheckResult lin = check_linearizable(k.history().ops());
+            r.checked_ops = lin.ops;
+            for (const KeyReport& kr : lin.keys) r.max_states = std::max(r.max_states, kr.states);
+            if (lin.verdict == Verdict::NotLinearizable) r.failure = "not linearizable\n" + lin.explanation;
+            else if (lin.verdict == Verdict::Unknown) ++r.unknown;
+        }
+        if (r.failure.empty()) r.failure = check_final_state(k);
     } catch (const std::exception& e) {
         r.failure = std::string("exception: ") + e.what();
     }
@@ -171,6 +195,7 @@ FuzzResult run_seed(std::uint64_t seed, const FaultProfile& p) {
             r.deduplicated += s->stats().replied_cached + s->state().stats().duplicates;
     r.crashes = faults.crashes;
     r.partitions = faults.partitions;
+    r.clients_partitioned = faults.clients_partitioned;
     return r;
 }
 
@@ -188,14 +213,30 @@ FuzzResult run_all(const FaultProfile& p, const char* name) {
         total.crashes += r.crashes;
         total.partitions += r.partitions;
         total.settle_ticks = std::max(total.settle_ticks, r.settle_ticks);
+        total.checked_ops += r.checked_ops;
+        total.unknown += r.unknown;
+        total.max_states = std::max(total.max_states, r.max_states);
+        total.clients_partitioned += r.clients_partitioned;
     }
+    std::printf("kv fuzz %s: %llu seeds, %llu ops checked for linearizability, %llu unknown, "
+                "largest per-key search %llu states, %llu client partitionings\n",
+                name, static_cast<unsigned long long>(seeds()),
+                static_cast<unsigned long long>(total.checked_ops), static_cast<unsigned long long>(total.unknown),
+                static_cast<unsigned long long>(total.max_states),
+                static_cast<unsigned long long>(total.clients_partitioned));
     return total;
+}
+
+// Both schedules also pull clients into partitions.
+FaultProfile with_client_partitions(FaultProfile p) {
+    p.client_partition = 0.5;
+    return p;
 }
 
 }  // namespace
 
 TEST(kv_fuzz_general_across_seeds) {
-    const FuzzResult t = run_all(FaultProfile::general(), "general");
+    const FuzzResult t = run_all(with_client_partitions(FaultProfile::general()), "general");
     // Observed per seed: ~149 completed operations, ~73 client timeouts,
     // ~122 redirects and ~89 retries absorbed by the session table. The
     // floors are about half that.
@@ -204,10 +245,11 @@ TEST(kv_fuzz_general_across_seeds) {
     CHECK(t.redirects > 60 * seeds());
     CHECK(t.deduplicated > 40 * seeds());
     CHECK(t.settle_ticks < kSettleBound);
+    CHECK_EQ(t.unknown, std::uint64_t{0});  // every history decided within the bound
 }
 
 TEST(kv_fuzz_nemesis_across_seeds) {
-    const FuzzResult t = run_all(FaultProfile::nemesis(), "nemesis");
+    const FuzzResult t = run_all(with_client_partitions(FaultProfile::nemesis()), "nemesis");
     // Observed per seed: ~79 completed, ~79 timeouts, ~163 redirects, ~51
     // absorbed retries.
     CHECK(t.completed > 40 * seeds());
@@ -215,12 +257,13 @@ TEST(kv_fuzz_nemesis_across_seeds) {
     CHECK(t.redirects > 80 * seeds());
     CHECK(t.deduplicated > 25 * seeds());
     CHECK(t.settle_ticks < kSettleBound);
+    CHECK_EQ(t.unknown, std::uint64_t{0});  // every history decided within the bound
 }
 
 TEST(kv_fuzz_is_reproducible) {
     for (std::uint64_t seed : {5ULL, 50ULL, 500ULL}) {
-        const FuzzResult a = run_seed(seed, FaultProfile::general());
-        const FuzzResult b = run_seed(seed, FaultProfile::general());
+        const FuzzResult a = run_seed(seed, with_client_partitions(FaultProfile::general()));
+        const FuzzResult b = run_seed(seed, with_client_partitions(FaultProfile::general()));
         CHECK(a.failure.empty());
         CHECK_EQ(a.completed, b.completed);
         CHECK_EQ(a.timeouts, b.timeouts);

@@ -10,6 +10,11 @@
 //   - nemesis(): 3 nodes, aimed at the Figure 8 window. It crashes new
 //     leaders 1..40 ticks after they win, and cuts the newest leader off
 //     alone, replacing any current partition.
+//   - client_partition: clients are normally global. With this probability,
+//     each client is pulled into a new partition instead. Isolating a leader
+//     puts it on the leader's side, so it is stuck with a minority leader;
+//     a random split puts it on a random side. A heal makes every client
+//     global again.
 
 #include <cstdint>
 #include <optional>
@@ -34,6 +39,7 @@ struct FaultProfile {
     double partition = 0.002;       // random two-way split
     double isolate_leader = 0.0;    // cut the newest leader off alone
     double heal = 0.004;
+    double client_partition = 0.0;  // per client, per partition event
     std::size_t nodes = 5;
     std::size_t max_down = 2;
     sim::NetworkConfig net{
@@ -115,7 +121,9 @@ public:
                 std::vector<NodeId> others;
                 for (NodeId id : c.ids())
                     if (id != *l) others.push_back(id);
-                c.partition({{*l}, others});
+                std::vector<std::vector<NodeId>> groups{{*l}, others};
+                place_clients(c, groups, 0);
+                c.partition(groups);
                 partitioned_ = true;
                 ++partitions;
             }
@@ -123,26 +131,49 @@ public:
             std::vector<NodeId> ids = c.ids();
             shuffle(ids, rng_);
             const auto cut = static_cast<std::ptrdiff_t>(rng_.uniform(1, p_.nodes - 1));
-            c.partition({{ids.begin(), ids.begin() + cut}, {ids.begin() + cut, ids.end()}});
+            std::vector<std::vector<NodeId>> groups{{ids.begin(), ids.begin() + cut},
+                                                    {ids.begin() + cut, ids.end()}};
+            place_clients(c, groups, std::nullopt);
+            c.partition(groups);
             partitioned_ = true;
             ++partitions;
         } else if (partitioned_ && rng_.bernoulli(p_.heal)) {
-            c.heal();
-            partitioned_ = false;
+            heal(c);
         }
     }
 
     // Heals the network and restarts every crashed node.
     void clear(RaftCluster& c) {
-        c.heal();
-        partitioned_ = false;
+        heal(c);
         for (NodeId id : c.ids()) c.restart(id);
     }
 
     std::uint64_t crashes = 0;
     std::uint64_t partitions = 0;
+    std::uint64_t clients_partitioned = 0;
 
 private:
+    void heal(RaftCluster& c) {
+        c.heal();
+        for (NodeId id : c.clients()) c.set_global(id, true);
+        partitioned_ = false;
+    }
+
+    // Pulls each client into `groups` with probability client_partition: into
+    // `side` if given, otherwise a random group. The others stay global.
+    void place_clients(RaftCluster& c, std::vector<std::vector<NodeId>>& groups, std::optional<std::size_t> side) {
+        for (NodeId id : c.clients()) {
+            if (rng_.bernoulli(p_.client_partition)) {
+                const std::size_t g = side ? *side : rng_.uniform(0, groups.size() - 1);
+                groups[g].push_back(id);
+                c.set_global(id, false);
+                ++clients_partitioned;
+            } else {
+                c.set_global(id, true);
+            }
+        }
+    }
+
     static std::size_t down(const RaftCluster& c) {
         std::size_t n = 0;
         for (NodeId id : c.ids()) n += c.is_up(id) ? 0 : 1;

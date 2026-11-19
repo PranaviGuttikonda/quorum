@@ -70,6 +70,7 @@ public:
     // Sends from a registered client.
     void client_send(NodeId from, NodeId to, std::string payload);
     bool is_server(NodeId id) const { return id >= 1 && id <= ids_.size(); }
+    const std::set<NodeId>& clients() const { return clients_; }
 
     // Null while the node is crashed.
     const RaftNode* node(NodeId id) const;
