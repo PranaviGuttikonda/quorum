@@ -22,17 +22,18 @@ std::optional<RaftMessage> decode_ae(codec::Reader& r) {
     const auto commit = r.u64();
     const auto n = r.u64();
     if (!term || !leader || !pidx || !pterm || !commit || !n) return std::nullopt;
-    // Every entry takes at least 5 bytes (" 0 0 " for an empty command), so a
-    // count that can't fit is rejected before anything is allocated.
-    if (*n > r.remaining() / 5) return std::nullopt;
+    // Every entry takes at least 7 bytes (" 0 0 0 " for an empty command), so
+    // a count that can't fit is rejected before anything is allocated.
+    if (*n > r.remaining() / 7) return std::nullopt;
     AppendEntries m{*term, *leader, *pidx, *pterm, *commit, {}};
     m.entries.reserve(*n);
     for (std::uint64_t i = 0; i < *n; ++i) {
         const auto et = r.u64();
-        if (!et) return std::nullopt;
+        const auto kind = r.u64();
+        if (!et || !kind || *kind > 1) return std::nullopt;
         const auto cmd = r.bytes();
         if (!cmd) return std::nullopt;
-        m.entries.push_back(LogEntry{*et, std::string(*cmd)});
+        m.entries.push_back(LogEntry{*et, std::string(*cmd), static_cast<EntryKind>(*kind)});
     }
     return m;
 }
@@ -65,7 +66,8 @@ std::string encode(const RaftMessage& msg) {
                     .u64(m.prev_log_term)
                     .u64(m.leader_commit)
                     .u64(m.entries.size());
-                for (const LogEntry& e : m.entries) w.u64(e.term).bytes(e.command);
+                for (const LogEntry& e : m.entries)
+                    w.u64(e.term).u64(static_cast<std::uint64_t>(e.kind)).bytes(e.command);
                 return w.str();
             },
             [](const AppendEntriesReply& m) {

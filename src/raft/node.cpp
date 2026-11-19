@@ -216,8 +216,9 @@ void RaftNode::start_election() {
 }
 
 // Approach: nextIndex starts just past our last entry and matchIndex at 0
-//           (Figure 2, volatile leader state). A heartbeat goes out at once to
-//           assert leadership (§5.2) and start probing the followers' logs.
+//           (Figure 2, volatile leader state). The no-op (§8) is appended
+//           after nextIndex is set, so the first AppendEntries round, sent at
+//           once to assert leadership (§5.2), already carries it.
 void RaftNode::become_leader() {
     role_ = Role::Leader;
     leader_id_ = id_;
@@ -225,6 +226,12 @@ void RaftNode::become_leader() {
     for (NodeId peer : peers_) {
         next_index_[peer] = last_log_index() + 1;
         match_index_[peer] = 0;
+    }
+    if (config_.append_noop_on_election) {
+        const LogEntry noop = LogEntry::noop(current_term_);
+        storage_.write_log(last_log_index(), std::span<const LogEntry>(&noop, 1));
+        log_.push_back(noop);
+        advance_leader_commit();  // a single-node cluster commits at once
     }
     broadcast_append();
 }

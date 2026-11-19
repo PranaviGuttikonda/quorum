@@ -26,7 +26,13 @@ struct NodeHarness {
     MemoryStorage storage;
     std::vector<Sent> outbox;
     std::vector<std::pair<LogIndex, LogEntry>> applied;
-    RaftConfig config{};
+    // The per-rule tests check raw mechanics, so the §8 no-op is off by
+    // default here. Tests of the no-op turn it back on.
+    RaftConfig config = [] {
+        RaftConfig c;
+        c.append_noop_on_election = false;
+        return c;
+    }();
     std::vector<NodeId> peers;
     std::uint64_t seed;
     std::optional<RaftNode> node;
@@ -35,6 +41,9 @@ struct NodeHarness {
         : peers(std::move(peer_ids)), seed(s) {
         boot();
     }
+    // The node's callbacks capture `this`, so the harness must stay put.
+    NodeHarness(const NodeHarness&) = delete;
+    NodeHarness& operator=(const NodeHarness&) = delete;
 
     // A brand-new node object over the same storage. Volatile state,
     // including what was applied, is gone.

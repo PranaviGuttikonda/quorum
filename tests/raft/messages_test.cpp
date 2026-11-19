@@ -53,6 +53,7 @@ TEST(raft_messages_entries_round_trip_any_bytes) {
                            {
                                {4, "set x 1"},
                                {5, ""},  // empty command
+                               LogEntry::noop(5),
                                {5, " leading and trailing "},
                                {5, "  "},
                                {5, binary},
@@ -71,7 +72,9 @@ TEST(raft_messages_encoding_is_readable) {
     CHECK_EQ(encode(RequestVoteReply{3, true}), std::string("RVR 3 1"));
     CHECK_EQ(encode(AppendEntries{4, 2, 0, 0, 0, {}}), std::string("AE 4 2 0 0 0 0"));
     CHECK_EQ(encode(AppendEntries{4, 2, 1, 3, 1, {{4, "x=1"}, {4, "a b"}}}),
-             std::string("AE 4 2 1 3 1 2 4 3 x=1 4 3 a b"));
+             std::string("AE 4 2 1 3 1 2 4 0 3 x=1 4 0 3 a b"));
+    CHECK_EQ(encode(AppendEntries{4, 2, 0, 0, 0, {LogEntry::noop(4)}}),
+             std::string("AE 4 2 0 0 0 1 4 1 0 "));
     CHECK_EQ(encode(AppendEntriesReply{4, false, 0, 6}), std::string("AER 4 0 0 6"));
 }
 
@@ -84,23 +87,25 @@ TEST(raft_messages_reject_malformed) {
              "RVR 1 2", "RVR 1", "RVR 1 1 ", "XX 1 2", "rv 1 2 3 4",
              "AER 1 1 0", "AER 1 yes 0 0", "AER 1 1 0 0 0",
              "AE 1 2 3 4", "AE 1 2 3 4 5",      // missing entry count
-             "AE 1 2 0 0 0 1",                  // count 1, no entry
-             "AE 1 2 0 0 0 1 1",                // entry missing length
-             "AE 1 2 0 0 0 1 1 3",              // missing bytes
-             "AE 1 2 0 0 0 1 1 3 ab",           // too few bytes
-             "AE 1 2 0 0 0 1 1 3 abcd",         // trailing byte
-             "AE 1 2 0 0 0 1 1 3 abc ",         // trailing space
-             "AE 1 2 0 0 0 2 1 1 a",            // count larger than entries
-             "AE 1 2 0 0 0 0 1 1 a",            // entries beyond count
-             "AE 1 2 0 0 0 1 1 01a",            // length token not separated
-             "AE 1 2 0 0 0 99999999999 1 1 a",  // absurd count
+             "AE 1 2 0 0 0 1",                    // count 1, no entry
+             "AE 1 2 0 0 0 1 1",                  // entry missing kind
+             "AE 1 2 0 0 0 1 1 0",                // entry missing length
+             "AE 1 2 0 0 0 1 1 0 3",              // missing bytes
+             "AE 1 2 0 0 0 1 1 0 3 ab",           // too few bytes
+             "AE 1 2 0 0 0 1 1 0 3 abcd",         // trailing byte
+             "AE 1 2 0 0 0 1 1 0 3 abc ",         // trailing space
+             "AE 1 2 0 0 0 1 1 2 3 abc",          // unknown entry kind
+             "AE 1 2 0 0 0 2 1 0 1 a",            // count larger than entries
+             "AE 1 2 0 0 0 0 1 0 1 a",            // entries beyond count
+             "AE 1 2 0 0 0 1 1 0 01a",            // length token not separated
+             "AE 1 2 0 0 0 99999999999 1 0 1 a",  // absurd count
          })
         check_rejected(bad, __LINE__);
 }
 
 TEST(raft_messages_every_truncation_is_rejected) {
     const std::string full =
-        encode(AppendEntries{4, 2, 1, 3, 1, {{4, "x = 1"}, {4, ""}, {4, "tail"}}});
+        encode(AppendEntries{4, 2, 1, 3, 1, {{4, "x = 1"}, LogEntry::noop(4), {4, "tail"}}});
     CHECK(decode(full).has_value());
     for (std::size_t len = 0; len < full.size(); ++len) check_rejected(full.substr(0, len), __LINE__);
 }

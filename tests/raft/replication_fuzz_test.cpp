@@ -190,19 +190,12 @@ FuzzResult run_seed(std::uint64_t seed, const Profile& p = {}) {
             c.tick();
         }
 
-        // Heal everything. Loss and duplicates stay on. Once a stable leader
-        // exists, give it an entry of its own term so its whole log can
-        // commit (§5.4.2).
+        // Heal everything. Loss and duplicates stay on. The final leader's
+        // no-op (§8) lets its whole log commit.
         c.heal();
         for (NodeId id : c.ids()) c.restart(id);
         const Tick settle_start = c.now();
-        while (!failed() && !converged(c) && c.now() - settle_start < kSettleBound) {
-            if (const auto l = c.stable_leader()) {
-                const RaftNode& n = *c.node(*l);
-                if (n.last_log_term() != n.current_term()) c.propose(*l, fresh());
-            }
-            c.tick();
-        }
+        while (!failed() && !converged(c) && c.now() - settle_start < kSettleBound) c.tick();
         r.settle_ticks = c.now() - settle_start;
 
         if (!election.ok()) {
@@ -218,11 +211,12 @@ FuzzResult run_seed(std::uint64_t seed, const Profile& p = {}) {
             const auto& log = c.node(*c.stable_leader())->log();
             std::set<std::string> seen;
             for (const auto& e : log) {
+                if (e.is_noop()) continue;
                 if (!seen.insert(e.command).second) r.failure = "command applied twice: " + e.command;
                 if (e.command.rfind("s" + std::to_string(seed) + "-", 0) != 0)
                     r.failure = "unknown command: " + e.command;
+                ++r.committed;
             }
-            r.committed = log.size();
         }
     } catch (const std::exception& e) {
         r.failure = std::string("exception: ") + e.what();

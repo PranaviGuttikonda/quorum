@@ -16,7 +16,7 @@ std::uint64_t mix(std::uint64_t z) {
 // Approach: fold the term and the command bytes (FNV-1a style) into the
 //           previous prefix hash, then finalize with the length.
 std::uint64_t chain(std::uint64_t prev, const LogEntry& e) {
-    std::uint64_t h = mix(prev ^ (e.term * 0x9e3779b97f4a7c15ULL));
+    std::uint64_t h = mix(prev ^ (e.term * 0x9e3779b97f4a7c15ULL) ^ static_cast<std::uint64_t>(e.kind));
     for (unsigned char ch : e.command) {
         h ^= ch;
         h *= 0x100000001b3ULL;

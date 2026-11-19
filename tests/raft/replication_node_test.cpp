@@ -298,3 +298,57 @@ TEST(replication_config_rejects_zero_batch) {
     c.max_entries_per_append = 0;
     CHECK_THROWS(validate(c));
 }
+
+namespace {
+
+void enable_noop(Harness& h) {
+    h.config.append_noop_on_election = true;
+    h.boot();
+}
+
+}  // namespace
+
+TEST(replication_new_leader_appends_noop_and_sends_it_at_once) {
+    Harness h;
+    enable_noop(h);
+    h.tick_until_candidate();
+    h.outbox.clear();
+    h.deliver(2, RequestVoteReply{1, true});
+    h.deliver(3, RequestVoteReply{1, true});
+    CHECK(h.node->role() == Role::Leader);
+    CHECK((h.node->log() == std::vector<LogEntry>{LogEntry::noop(1)}));
+    CHECK((h.storage.load().log == std::vector<LogEntry>{LogEntry::noop(1)}));  // persisted first
+    const auto aes = h.take<AppendEntries>();
+    CHECK_EQ(aes.size(), std::size_t{4});
+    for (const auto& [to, ae] : aes)
+        CHECK((ae == AppendEntries{1, 1, 0, 0, 0, {LogEntry::noop(1)}}));
+    // A client command goes after the no-op.
+    CHECK((h.node->propose("a") == ProposeResult{Proposed{2, 1}}));
+}
+
+TEST(replication_noop_commits_older_entries_promptly) {
+    // Given: a leader with uncommitted entries from older terms.
+    // Approach: §8: once its own no-op is on a majority, the older entries
+    //           commit with it, without waiting for a client write. The state
+    //           machine is handed the no-op too, and is expected to skip it.
+    Harness h;
+    enable_noop(h);
+    h.preload(2, std::nullopt, {{1, "x"}, {2, "y"}});
+    h.make_leader();  // term 3, log [x, y, noop]
+    CHECK_EQ(h.node->last_log_index(), LogIndex{3});
+    CHECK(h.node->log()[2].is_noop());
+    h.deliver(2, AppendEntriesReply{3, true, 3, 3});
+    h.deliver(3, AppendEntriesReply{3, true, 3, 3});
+    CHECK_EQ(h.node->commit_index(), LogIndex{3});
+    CHECK_EQ(h.applied.size(), std::size_t{3});
+    CHECK(h.applied[2].second.is_noop());
+}
+
+TEST(replication_single_node_commits_its_noop_on_election) {
+    Harness h({});
+    enable_noop(h);
+    h.tick(h.node->election_timeout());
+    CHECK(h.node->role() == Role::Leader);
+    CHECK_EQ(h.node->commit_index(), LogIndex{1});
+    CHECK(h.applied.at(0).second.is_noop());
+}

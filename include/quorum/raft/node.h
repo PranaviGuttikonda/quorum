@@ -30,6 +30,10 @@ struct RaftConfig {
     Tick election_timeout_max = 300;
     Tick heartbeat_interval = 50;  // must be < election_timeout_min
     std::size_t max_entries_per_append = 64;
+    // §8: a new leader appends a no-op entry of its own term, so entries from
+    // earlier terms commit as soon as the no-op does. Tests that exercise the
+    // raw §5.4.2 commit rule (Figure 8) turn it off.
+    bool append_noop_on_election = true;
 };
 
 // Throws std::invalid_argument unless 1 <= heartbeat < min <= max and

@@ -67,9 +67,11 @@ bool converged(const RaftCluster& c) {
     return true;
 }
 
+// Client commands only: leaders also append no-ops (§8).
 std::vector<std::string> commands(const std::vector<LogEntry>& log) {
     std::vector<std::string> out;
-    for (const auto& e : log) out.push_back(e.command);
+    for (const auto& e : log)
+        if (!e.is_noop()) out.push_back(e.command);
     return out;
 }
 
@@ -87,12 +89,15 @@ TEST(replication_stable_cluster_replicates_and_applies_in_order) {
             if (id != *leader)
                 CHECK_SEED(seed, (k.c.propose(id, "x") == ProposeResult{NotLeader{*leader}}));
 
+        // The leader's log so far holds only its no-op, so the first command
+        // lands right after it, and each later one takes the next index.
+        CHECK_SEED(seed, k.c.node(*leader)->log().size() == 1 && k.c.node(*leader)->log()[0].is_noop());
         std::vector<std::string> want;
         for (int tick = 0; tick < 20; ++tick) {
             for (int j = 0; j < 5; ++j) {
                 const std::string cmd = "cmd-" + std::to_string(want.size());
                 const auto r = k.c.propose(*leader, cmd);
-                CHECK_SEED(seed, (r == ProposeResult{Proposed{want.size() + 1, term}}));
+                CHECK_SEED(seed, (r == ProposeResult{Proposed{want.size() + 2, term}}));
                 want.push_back(cmd);
             }
             k.c.tick();
@@ -100,7 +105,7 @@ TEST(replication_stable_cluster_replicates_and_applies_in_order) {
         CHECK_SEED(seed, k.c.run_until(converged, kConvergeBound));
         for (NodeId id : k.c.ids()) {
             CHECK_SEED(seed, commands(k.c.applied(id)) == want);
-            CHECK_SEED(seed, k.c.node(id)->commit_index() == want.size());
+            CHECK_SEED(seed, k.c.node(id)->commit_index() == want.size() + 1);
         }
         CHECK_SEED(seed, k.c.stable_leader() == leader);
         if (!k.ok()) quorum::test::fail(__FILE__, __LINE__, k.why());
@@ -118,13 +123,16 @@ TEST(replication_crashed_follower_catches_up) {
         // More entries than one batch, so catch-up needs several rounds.
         for (int i = 0; i < 150; ++i) k.c.propose(*leader, "e" + std::to_string(i));
         CHECK_SEED(seed, k.c.run_until(
-                             [&](const RaftCluster& c) { return c.node(*leader)->commit_index() == 150; },
+                             [&](const RaftCluster& c) {
+                                 const RaftNode& l = *c.node(*leader);
+                                 return l.commit_index() == l.last_log_index();
+                             },
                              kConvergeBound));
 
         k.c.restart(lagger);
-        CHECK_SEED(seed, k.c.node(lagger)->log().empty());  // it saw nothing before crashing
+        CHECK_SEED(seed, commands(k.c.node(lagger)->log()).empty());  // it saw no command before crashing
         CHECK_SEED(seed, k.c.run_until(converged, kConvergeBound));
-        CHECK_SEED(seed, k.c.applied(lagger).size() == 150);
+        CHECK_SEED(seed, commands(k.c.applied(lagger)).size() == 150);
         if (!k.ok()) quorum::test::fail(__FILE__, __LINE__, k.why());
     }
 }
@@ -145,7 +153,10 @@ TEST(replication_partitioned_follower_catches_up_and_cannot_win) {
             if (i % 10 == 0) k.c.tick();
         }
         CHECK_SEED(seed, k.c.run_until(
-                             [&](const RaftCluster& c) { return c.node(*leader)->commit_index() == 200; },
+                             [&](const RaftCluster& c) {
+                                 const RaftNode& l = *c.node(*leader);
+                                 return l.commit_index() == l.last_log_index();
+                             },
                              kConvergeBound));
         // The isolated node kept timing out, so its term is now the highest.
         k.c.run_for(1000);
@@ -156,7 +167,7 @@ TEST(replication_partitioned_follower_catches_up_and_cannot_win) {
         // Its higher term forced an election, but its stale log can't win one
         // (§5.4.1). Every committed entry survives.
         CHECK_SEED(seed, k.c.stable_leader() != lagger);
-        CHECK_SEED(seed, k.c.applied(lagger).size() == 200);
+        CHECK_SEED(seed, commands(k.c.applied(lagger)).size() == 200);
         if (!k.ok()) quorum::test::fail(__FILE__, __LINE__, k.why());
     }
 }
@@ -193,9 +204,12 @@ TEST(replication_conflicting_uncommitted_entries_are_overwritten) {
         k.c.propose(new_leader, "kept-1");
         k.c.propose(new_leader, "kept-2");
         CHECK_SEED(seed, k.c.run_until(
-                             [&](const RaftCluster& c) { return c.node(new_leader)->commit_index() == 3; },
+                             [&](const RaftCluster& c) {
+                                 const RaftNode& l = *c.node(new_leader);
+                                 return l.commit_index() == l.last_log_index();
+                             },
                              kConvergeBound));
-        CHECK_SEED(seed, k.c.node(*old_leader)->log().size() == 4);  // base + 3 uncommitted
+        CHECK_SEED(seed, commands(k.c.node(*old_leader)->log()).size() == 4);  // base + 3 uncommitted
 
         k.c.heal();
         CHECK_SEED(seed, k.c.run_until(converged, kConvergeBound));
@@ -224,20 +238,12 @@ TEST(replication_survives_loss_and_duplicates) {
                 proposed.insert("d" + std::to_string(i));
             k.c.run_for(3);
         }
-        // Make sure the final leader has an entry of its own term, so the
-        // whole log can commit (§5.4.2).
-        for (int attempt = 0; attempt < 20 && !converged(k.c); ++attempt) {
-            if (const auto l = k.c.stable_leader()) {
-                const RaftNode& n = *k.c.node(*l);
-                if (n.last_log_term() != n.current_term()) k.c.propose(*l, "noop");
-            }
-            k.c.run_for(200);
-        }
-        CHECK_SEED(seed, converged(k.c));
+        // The final leader's no-op lets its whole log commit.
+        CHECK_SEED(seed, k.c.run_until(converged, kConvergeBound));
         // Duplicate delivery never duplicates log entries.
         const auto& log = k.c.node(*k.c.stable_leader())->log();
         std::set<std::string> seen;
-        for (const auto& e : log) CHECK_SEED(seed, seen.insert(e.command).second);
+        for (const auto& cmd : commands(log)) CHECK_SEED(seed, seen.insert(cmd).second);
         CHECK_SEED(seed, k.c.network().stats().duplicated > 0);
         if (!k.ok()) quorum::test::fail(__FILE__, __LINE__, k.why());
     }
@@ -257,7 +263,11 @@ TEST(replication_figure8_scenario_over_the_network) {
     //           checkers report. Every step is checked, so the test can't pass
     //           vacuously.
     for (std::uint64_t seed = 1; seed <= 20; ++seed) {
-        RaftCluster c(seed, 3);
+        // No §8 no-op here: this test exercises the raw §5.4.2 rule, which a
+        // no-op would satisfy on the leader's behalf.
+        RaftConfig raw;
+        raw.append_noop_on_election = false;
+        RaftCluster c(seed, 3, raw);
         ElectionSafetyChecker election;
         LogSafetyChecker logs;
         c.add_observer([&](const RaftCluster& cl) {

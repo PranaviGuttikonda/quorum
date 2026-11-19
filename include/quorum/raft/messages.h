@@ -11,7 +11,7 @@
 //   RV  <term> <candidate> <lastLogIndex> <lastLogTerm>
 //   RVR <term> <granted:0|1>
 //   AE  <term> <leader> <prevLogIndex> <prevLogTerm> <leaderCommit> <n>
-//       followed by n times: " <term> <len> <bytes>"
+//       followed by n times: " <term> <kind:0|1> <len> <bytes>"
 //   AER <term> <success:0|1> <matchIndex> <lastLogIndex>
 
 #include <optional>
