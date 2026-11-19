@@ -22,9 +22,9 @@ replayed exactly from its seed.
 
 0. **Foundation** *(done)*: CMake build, test harness, CI, a seeded RNG, a tick clock,
    and a simulated network with delay, loss, partitions and crash/restart.
-1. **Leader election** *(current)*: terms, `RequestVote`, randomized election timeouts and
+1. **Leader election** *(done)*: terms, `RequestVote`, randomized election timeouts and
    heartbeats. Safety check: at most one leader per term.
-2. **Log replication**: `AppendEntries`, the log-matching property, commit index
+2. **Log replication** *(current)*: `AppendEntries`, the log-matching property, commit index
    advancement, and follower catch-up after lag.
 3. **Key-value state machine**: `get` / `put` / `delete` applied from committed entries,
    a client API with leader redirection, and request de-duplication.
