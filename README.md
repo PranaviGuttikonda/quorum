@@ -2,8 +2,9 @@
 
 A Raft-based replicated key-value store in C++20, tested with deterministic simulation.
 
-> **Status:** step 3 of the roadmap: leader election and log replication (Raft §5.2–5.4)
-> on a deterministic simulated network. There is no key-value state machine yet.
+> **Status:** step 4 of the roadmap: a replicated key-value store (put, get, delete, cas)
+> with exactly-once client requests, on Raft (§5.2–5.4, §8), on a deterministic simulated
+> network.
 
 ## Why deterministic simulation
 
@@ -27,12 +28,15 @@ To run only some tests, pass a substring of their names:
 ```sh
 ./build/tests/quorum_tests network_partition
 ./build/tests/quorum_tests replication_fuzz
+./build/tests/quorum_tests kv_
 ```
 
 The fuzz tests run 1,000 seeds each with random crashes, partitions, 10% message loss and
 10% duplicate delivery while clients keep writing. Invariant checkers run after every tick:
-Election Safety, Log Matching, State Machine Safety and Leader Completeness. A failure
-prints its seed, and the same seed replays the same run exactly.
+Election Safety, Log Matching, State Machine Safety and Leader Completeness. The KV fuzz
+also checks that every replica ends up with the same map, and that every client operation
+executed exactly once. A failure prints its seed, and the same seed replays the same run
+exactly.
 
 The code builds with `-Wall -Wextra -Werror`. CI runs on Ubuntu and macOS in Debug and
 Release.
@@ -41,7 +45,9 @@ Release.
 
 ```
 include/quorum/sim/    deterministic RNG, tick clock, simulated network
-include/quorum/raft/   Raft node, messages, storage, test cluster, invariant checkers
+include/quorum/codec/  strict text codec shared by every wire format
+include/quorum/raft/   Raft node, messages, storage, services, test cluster, invariant checkers
+include/quorum/kv/     KV state machine, server, simulated client, history, KV cluster
 src/                   implementation
 tests/                 test harness and tests
 docs/                  design notes

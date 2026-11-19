@@ -24,9 +24,9 @@ replayed exactly from its seed.
    and a simulated network with delay, loss, partitions and crash/restart.
 1. **Leader election** *(done)*: terms, `RequestVote`, randomized election timeouts and
    heartbeats. Safety check: at most one leader per term.
-2. **Log replication** *(current)*: `AppendEntries`, the log-matching property, commit index
+2. **Log replication** *(done)*: `AppendEntries`, the log-matching property, commit index
    advancement, and follower catch-up after lag.
-3. **Key-value state machine**: `get` / `put` / `delete` applied from committed entries,
+3. **Key-value state machine** *(current)*: `get` / `put` / `delete` applied from committed entries,
    a client API with leader redirection, and request de-duplication.
 4. **Fault testing**: randomized simulations that run many seeds with partitions,
    crashes, message loss and reordering. Invariant checkers cover election safety, log
