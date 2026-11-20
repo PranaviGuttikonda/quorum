@@ -15,6 +15,17 @@ endif()
 add_library(quorum_warnings INTERFACE)
 target_compile_options(quorum_warnings INTERFACE -Wall -Wextra -Werror)
 
+# Given: the engine uses exceptions (DiskCrash, input validation), and
+#        Emscripten disables catching them by default.
+# Approach: native WebAssembly exceptions for every target in the web build.
+#           Release optimizes for size there: -Os is 16% smaller than -O3 and
+#           re-simulates just as fast.
+if(EMSCRIPTEN)
+  add_compile_options(-fwasm-exceptions)
+  add_link_options(-fwasm-exceptions)
+  set(CMAKE_CXX_FLAGS_RELEASE "-Os -DNDEBUG")
+endif()
+
 # Given: the file layer sits below Raft, and SimDisk only needs its header.
 # Approach: quorum_storage has no quorum dependencies.
 add_library(quorum_storage
@@ -53,5 +64,20 @@ add_library(quorum_kv
 target_include_directories(quorum_kv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(quorum_kv PUBLIC quorum_raft PRIVATE quorum_warnings)
 
-enable_testing()
-add_subdirectory(tests)
+# Given: the browser visualizer hosts the engine, and its host must be
+#        testable natively as well as compiled to WebAssembly.
+# Approach: quorum_websim is plain C++. The embind bindings and the page are
+#           only built under Emscripten (web/CMakeLists.txt).
+add_library(quorum_websim src/web/simulation.cpp)
+target_include_directories(quorum_websim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(quorum_websim PUBLIC quorum_kv PRIVATE quorum_warnings)
+
+add_executable(quorum_scenario tools/scenario.cpp)
+target_link_libraries(quorum_scenario PRIVATE quorum_websim quorum_warnings)
+
+if(EMSCRIPTEN)
+  add_subdirectory(web)
+else()
+  enable_testing()
+  add_subdirectory(tests)
+endif()

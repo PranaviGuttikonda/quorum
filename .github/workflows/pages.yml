@@ -1,0 +1,95 @@
+# Given: a push to main, or a pull request.
+# Approach: build the visualizer (the engine compiled to WebAssembly plus the
+#           static page) and check it:
+#   - the WASM build must print the same scenario trace as the native build
+#     for the same seeds (scripts/wasm_determinism.mjs vs quorum_scenario);
+#   - index.html is valid HTML (html-validate);
+#   - headless Chrome uses the page at desktop and phone sizes
+#     (scripts/web_smoke.mjs), and its screenshots are kept as an artifact.
+#   Pushes to main then deploy build-web/site to GitHub Pages, and check that
+#   the live page carries its link-preview tags and serves og-image.png as a
+#   PNG. Pull requests only build and check.
+name: Web
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the native scenario tool
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel --target quorum_scenario
+
+      - name: Build the site
+        run: |
+          emcmake cmake -S . -B build-web -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-web --parallel --target quorum_web
+
+      - name: WASM matches native
+        run: |
+          build/quorum_scenario 1 2 3 7 42 > native.txt
+          node scripts/wasm_determinism.mjs build-web/site/quorum.js 1 2 3 7 42 > wasm.txt
+          diff native.txt wasm.txt
+          echo "identical: $(wc -l < native.txt) lines"
+
+      - name: Valid HTML
+        run: npx --yes html-validate@9.7.1 web/index.html
+
+      - name: Use the page in headless Chrome
+        run: CHROME=$(which google-chrome || which chromium) node scripts/web_smoke.mjs build-web/site screenshots
+
+      - name: Site size
+        run: du -ab build-web/site | sort -n
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: screenshots
+          path: screenshots
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: build-web/site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Check the live page
+        run: |
+          url="${{ steps.deployment.outputs.page_url }}"
+          for i in $(seq 1 20); do curl -fsS "$url" -o page.html && grep -q 'twitter:card' page.html && break; sleep 6; done
+          for tag in 'property="og:title"' 'property="og:description"' 'property="og:image"' 'property="og:url"' 'name="twitter:card" content="summary_large_image"'; do
+            grep -q "$tag" page.html || { echo "missing $tag"; exit 1; }
+          done
+          curl -fsSI "${url}og-image.png" | tee headers.txt
+          grep -qi '^content-type: image/png' headers.txt

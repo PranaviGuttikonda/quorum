@@ -4,6 +4,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace quorum::sim {
@@ -154,6 +155,23 @@ void SimNetwork::partition(const std::vector<std::vector<NodeId>>& groups) {
 
 void SimNetwork::heal() {
     for (auto& [id, n] : nodes_) n.group = 0;
+}
+
+std::vector<InFlight> SimNetwork::in_flight_messages() const {
+    std::vector<const Pending*> order;
+    order.reserve(queue_.size());
+    for (const Pending& p : queue_) order.push_back(&p);
+    std::sort(order.begin(), order.end(), [](const Pending* a, const Pending* b) {
+        return std::tie(a->msg.deliver_at, a->msg.id, a->copy) < std::tie(b->msg.deliver_at, b->msg.id, b->copy);
+    });
+    std::vector<InFlight> out;
+    out.reserve(order.size());
+    for (const Pending* p : order) {
+        const Node& to = node(p->msg.to);
+        const bool doomed = !to.up || to.incarnation != p->receiver_incarnation || !can_reach(p->msg.from, p->msg.to);
+        out.push_back(InFlight{p->msg, p->copy == 1, doomed});
+    }
+    return out;
 }
 
 bool SimNetwork::can_reach(NodeId from, NodeId to) const {
