@@ -21,8 +21,9 @@ add_executable(quorum_tests
   kv/kv_test.cpp
   kv/linearizability_test.cpp
   kv/kv_fuzz_test.cpp
+  web/simulation_test.cpp
 )
 target_include_directories(quorum_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(quorum_tests PRIVATE quorum_kv quorum_warnings)
+target_link_libraries(quorum_tests PRIVATE quorum_websim quorum_warnings)
 
 add_test(NAME quorum_tests COMMAND quorum_tests)

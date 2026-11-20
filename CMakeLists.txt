@@ -53,5 +53,16 @@ add_library(quorum_kv
 target_include_directories(quorum_kv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(quorum_kv PUBLIC quorum_raft PRIVATE quorum_warnings)
 
+# Given: the browser visualizer hosts the engine, and its host must be
+#        testable natively as well as compiled to WebAssembly.
+# Approach: quorum_websim is plain C++. The embind bindings and the page are
+#           only built under Emscripten (web/CMakeLists.txt).
+add_library(quorum_websim src/web/simulation.cpp)
+target_include_directories(quorum_websim PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(quorum_websim PUBLIC quorum_kv PRIVATE quorum_warnings)
+
+add_executable(quorum_scenario tools/scenario.cpp)
+target_link_libraries(quorum_scenario PRIVATE quorum_websim quorum_warnings)
+
 enable_testing()
 add_subdirectory(tests)
