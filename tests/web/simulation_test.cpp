@@ -7,6 +7,8 @@
 //           queueing, JSON escaping, and reproducibility of the scenario
 //           trace that CI compares across native and WASM builds.
 
+#include <algorithm>
+#include <set>
 #include <string>
 
 #include "harness.h"
@@ -18,6 +20,7 @@ using namespace quorum;
 using quorum::testing::JsonValue;
 using quorum::testing::parse_json;
 using web::Simulation;
+using sim::Tick;
 
 namespace {
 
@@ -134,8 +137,11 @@ void check_snapshot(const Simulation& s) {
         CHECK_AT(s, clients[i]["idle"].boolean() == cl.idle());
     }
 
+    // Submitted operations only, the last kOpTail of them.
+    std::vector<Simulation::WebOp> all;
+    for (const auto& w : s.ops())
+        if (!w.generated) all.push_back(w);
     const auto& ops = j["ops"].arr();
-    const auto& all = s.ops();
     CHECK_AT(s, ops.size() == std::min(all.size(), Simulation::kOpTail));
     for (std::size_t i = 0; i < ops.size(); ++i) {
         const auto& w = all[all.size() - ops.size() + i];
@@ -159,6 +165,22 @@ void check_snapshot(const Simulation& s) {
             CHECK_AT(s, !jo["server"].is_null() && c.is_server(static_cast<raft::NodeId>(jo["server"].num())));
             CHECK_AT(s, jo["sends"].num() >= 1);
         }
+    }
+
+    // Metrics, chaos and the event count.
+    const JsonValue& m = j["metrics"];
+    CHECK_AT(s, m["elections"].num() == s.elections());
+    CHECK_AT(s, m["leaderlessTicks"].num() == s.leaderless_ticks());
+    CHECK_AT(s, m["ticksPerSecond"].num() == Simulation::kTicksPerSecond);
+    if (!m["p50"].is_null()) CHECK_AT(s, m["p50"].num() <= m["p99"].num());
+    CHECK_AT(s, j["load"].boolean() == s.load());
+    CHECK_AT(s, j["eventCount"].num() == s.first_event() + s.events().size());
+    CHECK_AT(s, j["chaos"].is_null() == !s.chaos().has_value());
+    if (s.chaos()) {
+        const auto& ch = *s.chaos();
+        CHECK_AT(s, j["chaos"]["start"].num() == ch.start && j["chaos"]["end"].num() == ch.end);
+        CHECK_AT(s, j["chaos"].has("verdict") == ch.result.has_value());
+        if (ch.result) CHECK_AT(s, j["chaos"]["ops"].num() == ch.result->ops);
     }
 }
 
@@ -278,4 +300,125 @@ TEST(web_scenario_trace_is_reproducible) {
     CHECK_EQ(a, web::scenario_trace(1));
     CHECK(a != web::scenario_trace(2));
     CHECK(a.find("crash") != std::string::npos && a.find("split") != std::string::npos);
+}
+
+TEST(web_chaos_reports_linearizable_on_several_seeds) {
+    for (std::uint64_t seed : {1ULL, 2ULL, 3ULL, 4ULL, 5ULL, 6ULL}) {
+        Simulation s(seed, 5);
+        s.tick(300);
+        CHECK_AT(s, s.start_chaos());
+        CHECK_AT(s, !s.start_chaos());  // already running
+        CHECK_AT(s, s.load());
+        const Tick limit = s.now() + Simulation::kChaosTicks + Simulation::kChaosSettle + 10;
+        while (s.chaos()->phase != Simulation::Chaos::Phase::Done && s.now() < limit) {
+            s.tick(97);
+            check_snapshot(s);
+        }
+        const auto& ch = *s.chaos();
+        CHECK_AT(s, ch.phase == Simulation::Chaos::Phase::Done && ch.result.has_value());
+        CHECK_AT(s, ch.result->verdict == kv::Verdict::Linearizable);
+        CHECK_AT(s, ch.result->ops > 60);  // observed 108..168 on these seeds
+        CHECK_AT(s, !s.load());  // restored
+        // Chaos really happened, and was undone.
+        std::size_t crashes = 0, splits = 0, checks = 0;
+        for (const auto& e : s.events()) {
+            crashes += e.kind == "crash" && e.chaos;
+            splits += e.kind == "split" && e.chaos;
+            checks += e.kind == "check";
+        }
+        CHECK_AT(s, crashes >= 3 && splits >= 1 && checks == 1);
+        for (raft::NodeId id : s.cluster().raft().ids()) {
+            CHECK_AT(s, s.cluster().raft().is_up(id));
+            CHECK_AT(s, s.cluster().raft().network().group_of(id) == 0);
+        }
+        // Chaos can run again.
+        CHECK_AT(s, s.start_chaos());
+    }
+}
+
+TEST(web_load_generator_drives_both_clients) {
+    Simulation s(11, 5);
+    s.tick(400);
+    s.set_load(true);
+    s.tick(3000);
+    std::size_t generated = 0;
+    std::set<std::uint32_t> clients;
+    for (const auto& w : s.ops()) {
+        generated += w.generated;
+        if (w.generated) clients.insert(w.client);
+    }
+    CHECK(generated > 50);  // observed 102
+    CHECK_EQ(clients.size(), std::size_t{2});
+    const JsonValue j = parse_json(s.snapshot());
+    CHECK(j["ops"].arr().empty());  // generated operations stay out of the console
+    CHECK(j["metrics"]["writesPerSec"].real() > 0.5);
+    CHECK(j["metrics"]["latencyOps"].num() > 50 && j["metrics"]["latencyOps"].num() <= Simulation::kLatencyWindow);
+    // Typed commands still go through, queued behind generated ones.
+    CHECK(s.submit(1, "put", "mine", "1") > 0);
+    s.set_load(false);
+    s.tick(1500);
+    const std::size_t before = s.ops().size();
+    s.tick(1000);
+    CHECK_EQ(s.ops().size(), before);  // off means off
+    const JsonValue k = parse_json(s.snapshot());
+    CHECK_EQ(k["ops"].arr().size(), std::size_t{1});
+    CHECK_EQ(k["ops"][0]["status"].str(), std::string("done"));
+}
+
+TEST(web_events_and_metrics_follow_the_engine) {
+    Simulation s(12, 5);
+    s.tick(600);
+    const auto first = *s.leader();
+    CHECK(s.elections() >= 1);
+    CHECK(s.leaderless_ticks() >= 150);  // nobody leads before the first timeout
+    const auto leaderless = s.leaderless_ticks();
+    s.crash(first);
+    s.tick(600);
+    CHECK(s.leaderless_ticks() > leaderless);
+    CHECK(s.elections() >= 2);
+    s.partition("1,2|3,4,5");
+    s.heal();
+    s.heal();  // nothing to heal: no event
+    s.restart(first);
+    s.submit(1, "put", "a", "1");
+    s.tick(400);
+    std::vector<std::string> kinds;
+    for (const auto& e : s.events()) kinds.push_back(e.kind);
+    auto count = [&](const std::string& k) { return std::count(kinds.begin(), kinds.end(), k); };
+    CHECK_EQ(static_cast<std::uint64_t>(count("elect")), s.elections());
+    CHECK_EQ(count("crash"), 1);
+    CHECK_EQ(count("restart"), 1);
+    CHECK_EQ(count("split"), 1);
+    CHECK_EQ(count("heal"), 1);
+    CHECK_EQ(count("op"), 1);
+    // events_json pages from an index.
+    const JsonValue all = parse_json(s.events_json(0));
+    CHECK_EQ(all["total"].num(), s.events().size());
+    CHECK_EQ(all["events"].arr().size(), s.events().size());
+    const JsonValue tail = parse_json(s.events_json(s.events().size() - 2));
+    CHECK_EQ(tail["events"].arr().size(), std::size_t{2});
+    CHECK_EQ(tail["events"][1]["kind"].str(), kinds.back());
+    CHECK(parse_json(s.events_json(1000))["events"].arr().empty());
+}
+
+TEST(web_resimulating_from_actions_is_exact) {
+    // What the page does when scrubbing: rebuild from the seed and replay the
+    // recorded actions at their ticks. Same actions, same ticks: same state.
+    auto run = [](Tick until) {
+        Simulation s(21, 5);
+        auto to = [&](Tick t) {
+            if (t > s.now()) s.tick(static_cast<std::uint32_t>(t - s.now()));
+        };
+        to(std::min<Tick>(until, 200));
+        if (until >= 200) s.set_load(true);
+        to(std::min<Tick>(until, 900));
+        if (until >= 900) s.crash(s.leader().value_or(1));
+        to(std::min<Tick>(until, 1500));
+        if (until >= 1500) s.start_chaos();
+        to(until);
+        return s.snapshot() + s.events_json(0);
+    };
+    CHECK_EQ(run(5000), run(5000));
+    CHECK(run(5000) != run(5001));
+    CHECK_EQ(run(1499), run(1499));
 }

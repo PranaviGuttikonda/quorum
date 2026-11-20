@@ -1,5 +1,7 @@
 #include "quorum/web/simulation.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <set>
 #include <stdexcept>
@@ -52,6 +54,12 @@ public:
         return *this;
     }
     Json& num(std::uint64_t v) { return raw(std::to_string(v)); }
+    // A number with one decimal (formatted the same way on every build).
+    Json& fixed1(double v) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.1f", v);
+        return raw(buf);
+    }
     Json& boolean(bool b) { return raw(b ? "true" : "false"); }
     template <typename T>
     Json& opt(const std::optional<T>& v) {
@@ -199,13 +207,23 @@ std::uint64_t fnv1a(std::string_view s) {
 }  // namespace
 
 Simulation::Simulation(std::uint64_t seed, std::size_t servers)
-    : seed_(seed), kv_(seed, web_config(servers)), queued_(kClients), running_(kClients) {}
+    : seed_(seed),
+      kv_(seed, web_config(servers)),
+      queued_(kClients),
+      running_(kClients),
+      load_rng_(seed ^ 0x10ad10ad10ad10adULL) {}
 
+// One tick: chaos acts first (as a user would, between ticks), then the load
+// generator, then queued operations start, then the engine ticks, and finally
+// the results are collected and observed.
 void Simulation::tick(std::uint32_t n) {
     for (std::uint32_t i = 0; i < n; ++i) {
+        chaos_step();
+        generate_load();
         start_queued();
         kv_.tick();
         collect();
+        observe();
     }
 }
 
@@ -219,6 +237,58 @@ void Simulation::start_queued() {
     }
 }
 
+void Simulation::generate_load() {
+    if (!load_ || (chaos_ && chaos_->phase == Chaos::Phase::Settling)) return;
+    for (std::size_t c = 0; c < kClients; ++c) {
+        if (running_[c] || !queued_[c].empty() || !load_rng_.bernoulli(kLoadRate)) continue;
+        WebOp w;
+        w.client = static_cast<std::uint32_t>(c + 1);
+        w.key = "k" + std::to_string(load_rng_.uniform(1, 3));
+        w.op = load_rng_.bernoulli(0.5) ? kv::Op::Put : kv::Op::Get;
+        if (w.op == kv::Op::Put) w.value = "c" + std::to_string(c + 1) + "-" + std::to_string(++load_ops_);
+        w.generated = true;
+        enqueue(std::move(w));
+    }
+}
+
+void Simulation::chaos_step() {
+    if (!chaos_ || chaos_->phase != Chaos::Phase::Running) return;
+    Chaos& ch = *chaos_;
+    auto& c = kv_.raft();
+    in_chaos_ = true;
+    if (now() >= ch.end) {
+        heal();
+        for (NodeId id : c.ids()) do_restart(id);
+        ch.phase = Chaos::Phase::Settling;
+        ch.settle_until = now() + kChaosSettle;
+        add_event("chaos", 0, "Chaos over: healed, restarted, waiting for clients");
+        in_chaos_ = false;
+        return;
+    }
+    std::vector<NodeId> up, down;
+    for (NodeId id : c.ids()) (c.is_up(id) ? up : down).push_back(id);
+    if (down.size() < kMaxDown && up.size() > 1 && ch.rng.bernoulli(0.003))
+        do_crash(up[ch.rng.uniform(0, up.size() - 1)]);
+    for (NodeId id : down)
+        if (ch.rng.bernoulli(0.008)) do_restart(id);
+    bool split = false;
+    for (NodeId id : c.ids()) split |= c.network().group_of(id) != 0;
+    if (!split && ch.rng.bernoulli(0.002)) {
+        std::vector<NodeId> ids = c.ids();
+        for (std::size_t i = ids.size(); i > 1; --i) std::swap(ids[i - 1], ids[ch.rng.uniform(0, i - 1)]);
+        const auto cut = static_cast<std::ptrdiff_t>(ch.rng.uniform(1, ids.size() - 1));
+        std::string text;
+        for (auto it = ids.begin(); it != ids.end(); ++it) {
+            if (it != ids.begin()) text += it - ids.begin() == cut ? '|' : ',';
+            text += std::to_string(*it);
+        }
+        partition(text);
+    } else if (split && ch.rng.bernoulli(0.006)) {
+        heal();
+    }
+    in_chaos_ = false;
+}
+
 void Simulation::collect() {
     for (std::size_t c = 0; c < kClients; ++c) {
         if (!running_[c]) continue;
@@ -227,6 +297,20 @@ void Simulation::collect() {
         if (kv_.client(c).idle()) {
             op.server = kv_.client(c).answered_by();
             running_[c].reset();
+            const kv::OpRecord& r = kv_.history().ops().at(*op.history);
+            const Tick latency = *r.completed - r.invoked;
+            completions_.push_back(Completion{*r.completed, latency, op.op != kv::Op::Get});
+            while (completions_.size() > kLatencyWindow &&
+                   completions_.front().at + 10 * kTicksPerSecond < now())
+                completions_.pop_front();
+            std::string text = describe_command(r.command) + " -> ";
+            if (op.op == kv::Op::Get) {
+                text += r.result->value ? "\"" + *r.result->value + "\"" : std::string("not found");
+            } else {
+                text += r.result->ok ? "ok" : "failed";
+            }
+            text += ", S" + std::to_string(op.server.value_or(0)) + ", " + std::to_string(latency) + " ticks";
+            add_event("op", op.server.value_or(0), std::move(text));
         }
     }
     for (const sim::TraceEvent& e : kv_.raft().network().trace())
@@ -235,18 +319,73 @@ void Simulation::collect() {
     while (!drops_.empty() && drops_.front().at + kDropMemory < now()) drops_.pop_front();
 }
 
-bool Simulation::crash(NodeId id) {
+bool Simulation::has_working_leader() const {
+    const auto& c = kv_.raft();
+    for (NodeId l : c.leaders()) {
+        std::size_t reach = 0;
+        for (NodeId id : c.ids()) reach += c.is_up(id) && c.network().can_reach(l, id);
+        if (reach * 2 > c.ids().size()) return true;
+    }
+    return false;
+}
+
+void Simulation::observe() {
+    const auto& c = kv_.raft();
+    for (NodeId l : c.leaders()) {
+        const raft::Term t = c.node(l)->current_term();
+        if (led_terms_.insert(t).second) {
+            ++elections_;
+            add_event("elect", l, "S" + std::to_string(l) + " elected leader, term " + std::to_string(t));
+        }
+    }
+    if (!has_working_leader()) ++leaderless_;
+
+    if (chaos_ && chaos_->phase == Chaos::Phase::Settling) {
+        bool idle = true;
+        for (std::size_t i = 0; i < kClients; ++i) idle &= !running_[i] && queued_[i].empty();
+        if (idle || now() >= chaos_->settle_until) {
+            chaos_->result = kv::check_linearizable(kv_.history().ops());
+            chaos_->phase = Chaos::Phase::Done;
+            load_ = chaos_->load_before;
+            const auto& r = *chaos_->result;
+            add_event("check", 0,
+                      std::to_string(r.ops) + " operations, " +
+                          (r.verdict == kv::Verdict::Linearizable ? std::string("linearizable")
+                                                                  : std::string(kv::to_string(r.verdict))));
+        }
+    }
+}
+
+void Simulation::add_event(std::string kind, NodeId node, std::string text) {
+    events_.push_back(Event{now(), std::move(kind), node, in_chaos_, std::move(text)});
+    if (events_.size() > kEventCap) {
+        events_.pop_front();
+        ++first_event_;
+    }
+}
+
+bool Simulation::do_crash(NodeId id) {
     auto& c = kv_.raft();
     if (!c.is_server(id) || !c.is_up(id)) return false;
     c.crash(id);
+    add_event("crash", id, "S" + std::to_string(id) + " crashed");
     return true;
 }
 
-bool Simulation::restart(NodeId id) {
+bool Simulation::do_restart(NodeId id) {
     auto& c = kv_.raft();
     if (!c.is_server(id) || c.is_up(id)) return false;
     c.restart(id);
+    add_event("restart", id, "S" + std::to_string(id) + " restarted");
     return true;
+}
+
+bool Simulation::crash(NodeId id) {
+    return do_crash(id);
+}
+
+bool Simulation::restart(NodeId id) {
+    return do_restart(id);
 }
 
 bool Simulation::partition(const std::string& text) {
@@ -271,11 +410,46 @@ bool Simulation::partition(const std::string& text) {
         rest.remove_prefix(bar + 1);
     }
     kv_.raft().partition(groups);
+    std::string desc;
+    for (const auto& g : groups) {
+        if (!desc.empty()) desc += " | ";
+        for (std::size_t i = 0; i < g.size(); ++i) desc += (i ? " " : "") + std::string("S") + std::to_string(g[i]);
+    }
+    add_event("split", 0, "Network split: " + desc);
     return true;
 }
 
 void Simulation::heal() {
+    bool split = false;
+    for (NodeId id : kv_.raft().ids()) split |= kv_.raft().network().group_of(id) != 0;
     kv_.raft().heal();
+    if (split) add_event("heal", 0, "Network healed");
+}
+
+void Simulation::set_load(bool on) {
+    load_ = on;
+    if (chaos_ && chaos_->phase != Chaos::Phase::Done) chaos_->load_before = on;
+}
+
+bool Simulation::start_chaos() {
+    if (chaos_ && chaos_->phase != Chaos::Phase::Done) return false;
+    Chaos ch;
+    ch.start = now();
+    ch.end = now() + kChaosTicks;
+    ch.load_before = load_;
+    ch.rng = sim::Rng(seed_ ^ 0xc4a05c4a05c4a05cULL ^ (now() * 0x9e3779b97f4a7c15ULL));
+    chaos_ = std::move(ch);
+    load_ = true;
+    in_chaos_ = true;
+    add_event("chaos", 0, "Chaos started: 60 simulated seconds of crashes and splits");
+    in_chaos_ = false;
+    return true;
+}
+
+void Simulation::enqueue(WebOp w) {
+    w.id = static_cast<std::int64_t>(ops_.size()) + 1;
+    ops_.push_back(std::move(w));
+    queued_[ops_.back().client - 1].push_back(ops_.size() - 1);
 }
 
 std::int64_t Simulation::submit(std::uint32_t client, const std::string& op, const std::string& key,
@@ -292,14 +466,33 @@ std::int64_t Simulation::submit(std::uint32_t client, const std::string& op, con
         return -1;
     }
     if (w.op == kv::Op::Put && value.empty()) return -1;
-    w.id = static_cast<std::int64_t>(ops_.size()) + 1;
     w.client = client;
     w.key = key;
     if (w.op == kv::Op::Put) w.value = value;
-    ops_.push_back(std::move(w));
-    queued_[client - 1].push_back(ops_.size() - 1);
+    enqueue(std::move(w));
     start_queued();
     return ops_.back().id;
+}
+
+std::string Simulation::events_json(std::size_t from) const {
+    Json j;
+    j.raw("{");
+    const std::size_t first = std::max(from, first_event_);
+    j.key("first").num(first);
+    j.key("total").num(first_event_ + events_.size());
+    j.key("events").raw("[");
+    for (std::size_t i = first - first_event_; i < events_.size(); ++i) {
+        const Event& e = events_[i];
+        j.item().raw("{");
+        j.key("t").num(e.tick);
+        j.key("kind").str(e.kind);
+        if (e.node) j.key("node").num(e.node);
+        if (e.chaos) j.key("chaos").boolean(true);
+        j.key("text").str(e.text);
+        j.raw("}");
+    }
+    j.raw("]}");
+    return j.take();
 }
 
 std::string Simulation::snapshot() const {
@@ -386,8 +579,13 @@ std::string Simulation::snapshot() const {
 
     j.key("ops").raw("[");
     const auto& history = kv_.history().ops();
-    const std::size_t from = ops_.size() > kOpTail ? ops_.size() - kOpTail : 0;
-    for (std::size_t i = from; i < ops_.size(); ++i) {
+    // Submitted operations only: the load generator's show up in metrics and
+    // events, and would otherwise push typed commands out of the console.
+    std::vector<std::size_t> shown;
+    for (std::size_t i = ops_.size(); i-- > 0 && shown.size() < kOpTail;)
+        if (!ops_[i].generated) shown.push_back(i);
+    std::reverse(shown.begin(), shown.end());
+    for (std::size_t i : shown) {
         const WebOp& w = ops_[i];
         j.item().raw("{");
         j.key("id").num(static_cast<std::uint64_t>(w.id));
@@ -414,6 +612,53 @@ std::string Simulation::snapshot() const {
         j.raw("}");
     }
     j.raw("]");
+
+    j.key("load").boolean(load_);
+    j.key("eventCount").num(first_event_ + events_.size());
+
+    // Metrics. Latency is over the last kLatencyWindow operations (nearest
+    // rank), writes per second over the last 10 simulated seconds.
+    {
+        std::uint64_t writes = 0;
+        for (const Completion& c : completions_)
+            writes += c.write && c.at + 10 * kTicksPerSecond > now();
+        std::vector<Tick> lat;
+        const std::size_t n = std::min(completions_.size(), kLatencyWindow);
+        for (std::size_t i = completions_.size() - n; i < completions_.size(); ++i) lat.push_back(completions_[i].latency);
+        std::sort(lat.begin(), lat.end());
+        auto rank = [&](double p) -> std::optional<Tick> {
+            if (lat.empty()) return std::nullopt;
+            const auto k = static_cast<std::size_t>(std::ceil(p * static_cast<double>(lat.size())));
+            return lat[std::max<std::size_t>(k, 1) - 1];
+        };
+        j.key("metrics").raw("{");
+        j.key("writesPerSec").fixed1(static_cast<double>(writes) / 10.0);
+        j.key("latencyOps").num(lat.size());
+        j.key("p50").opt(rank(0.50));
+        j.key("p99").opt(rank(0.99));
+        j.key("elections").num(elections_);
+        j.key("leaderlessTicks").num(leaderless_);
+        j.key("ticksPerSecond").num(kTicksPerSecond);
+        j.raw("}");
+    }
+
+    if (!chaos_) {
+        j.key("chaos").raw("null");
+    } else {
+        const Chaos& ch = *chaos_;
+        j.key("chaos").raw("{");
+        j.key("phase").str(ch.phase == Chaos::Phase::Running    ? "running"
+                           : ch.phase == Chaos::Phase::Settling ? "settling"
+                                                                : "done");
+        j.key("start").num(ch.start);
+        j.key("end").num(ch.end);
+        if (ch.result) {
+            j.key("verdict").str(kv::to_string(ch.result->verdict));
+            j.key("ops").num(ch.result->ops);
+            j.key("explanation").str(ch.result->explanation);
+        }
+        j.raw("}");
+    }
 
     const auto& st = net.stats();
     j.key("stats").raw("{");
@@ -461,6 +706,17 @@ std::string scenario_trace(std::uint64_t seed) {
         s.tick(37);
         step("tick");
     }
+    s.set_load(true);
+    s.tick(500);
+    step("load");
+    s.start_chaos();
+    s.tick(Simulation::kChaosTicks + 1000);
+    step("chaos");
+    s.set_load(false);
+    s.tick(600);
+    step("quiet");
+    out += s.events_json(0);
+    out += '\n';
     out += s.snapshot();
     out += '\n';
     return out;

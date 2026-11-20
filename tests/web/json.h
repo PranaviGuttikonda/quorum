@@ -4,7 +4,8 @@
 //        to compare it with the engine.
 // Approach: a strict, minimal recursive-descent parser for what JSON needs
 //           here: objects, arrays, strings (with escapes), non-negative
-//           integers, true, false and null. Anything else throws.
+//           integers, non-negative decimals (kept as double), true, false
+//           and null. Anything else throws.
 
 #include <cstdint>
 #include <map>
@@ -22,13 +23,16 @@ using JsonObject = std::map<std::string, JsonValue>;
 using JsonArray = std::vector<JsonValue>;
 
 struct JsonValue {
-    std::variant<std::nullptr_t, bool, std::uint64_t, std::string, std::shared_ptr<JsonArray>,
+    std::variant<std::nullptr_t, bool, std::uint64_t, double, std::string, std::shared_ptr<JsonArray>,
                  std::shared_ptr<JsonObject>>
         v;
 
     bool is_null() const { return std::holds_alternative<std::nullptr_t>(v); }
     bool boolean() const { return std::get<bool>(v); }
     std::uint64_t num() const { return std::get<std::uint64_t>(v); }
+    double real() const {
+        return std::holds_alternative<double>(v) ? std::get<double>(v) : static_cast<double>(num());
+    }
     const std::string& str() const { return std::get<std::string>(v); }
     const JsonArray& arr() const { return *std::get<std::shared_ptr<JsonArray>>(v); }
     const JsonObject& obj() const { return *std::get<std::shared_ptr<JsonObject>>(v); }
@@ -90,6 +94,13 @@ private:
         const std::size_t start = pos_;
         while (pos_ < s_.size() && s_[pos_] >= '0' && s_[pos_] <= '9') n = n * 10 + (s_[pos_++] - '0');
         if (s_[start] == '0' && pos_ - start > 1) fail("leading zero");
+        if (pos_ < s_.size() && s_[pos_] == '.') {
+            ++pos_;
+            const std::size_t frac = pos_;
+            while (pos_ < s_.size() && s_[pos_] >= '0' && s_[pos_] <= '9') ++pos_;
+            if (pos_ == frac) fail("bad decimal");
+            return JsonValue{std::stod(std::string(s_.substr(start, pos_ - start)))};
+        }
         return JsonValue{n};
     }
     std::string string() {

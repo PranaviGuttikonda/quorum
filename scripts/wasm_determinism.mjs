@@ -41,6 +41,12 @@ function replay(seed) {
   s.restart(first);
   s.tick(700);
   for (let i = 0; i < 5; ++i) s.tick(37);
+  s.setLoad(true);
+  s.tick(500);
+  s.startChaos();
+  s.tick(6000 + 1000);
+  s.setLoad(false);
+  s.tick(600);
   const snap = s.snapshot();
   s.delete();
   return snap;

@@ -29,7 +29,13 @@ EMSCRIPTEN_BINDINGS(quorum) {
                                                  const std::string& key, const std::string& value) {
                       return static_cast<double>(s.submit(client, op, key, value));
                   }))
+        .function("setLoad", &Simulation::set_load)
+        .function("load", &Simulation::load)
+        .function("startChaos", &Simulation::start_chaos)
         .function("snapshot", &Simulation::snapshot)
+        .function("eventsJson", optional_override([](const Simulation& s, double from) {
+                      return s.events_json(static_cast<std::size_t>(from));
+                  }))
         .function("now", optional_override([](const Simulation& s) { return static_cast<double>(s.now()); }))
         .function("seed", optional_override([](const Simulation& s) { return static_cast<double>(s.seed()); }));
     function("create", &create, allow_raw_pointers());
