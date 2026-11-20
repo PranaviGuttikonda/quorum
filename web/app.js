@@ -1,11 +1,15 @@
 // Given: quorum.js / quorum.wasm, the real engine behind web::Simulation.
 // Approach: the page only asks the engine to act (tick, crash, restart,
-//           partition, heal, submit) and draws what snapshot() reports. No
-//           Raft logic lives here. Between ticks, positions are interpolated so
-//           messages glide.
+//           partition, heal, submit, load, chaos) and draws what snapshot()
+//           and eventsJson() report. No Raft logic lives here. Between ticks,
+//           positions are interpolated so messages glide.
 //   - Every action is recorded with the tick it happened at. The URL holds
 //     the seed and that list, so a copied link replays the same run exactly.
-//   - The canvas is sized in device pixels, so it stays crisp on HiDPI.
+//   - Scrubbing the timeline back rebuilds the engine from the seed and
+//     replays the recorded actions up to that tick (fast: about 1 ms per 2,000
+//     ticks). The rest of the recording stays pending, so playing on retraces
+//     it; any new action instead starts a new branch from that moment.
+//   - The canvases are sized in device pixels, so they stay crisp on HiDPI.
 
 import createQuorum from './quorum.js';
 
@@ -13,8 +17,9 @@ const SERVERS = 5;
 const SPEEDS = [5, 15, 40, 100, 300];          // ticks per second
 const SPEED_NAMES = ['very slow', 'slow', 'normal', 'fast', 'very fast'];
 const MAX_TICKS_PER_FRAME = 400;
-const LOG_ROWS = 7;
+const LOG_ROWS = 6;
 const DROP_MEMORY = 12;                        // matches Simulation::kDropMemory
+const TL_SCALE = 0.25;                         // timeline pixels per tick
 
 const css = getComputedStyle(document.documentElement);
 const color = name => css.getPropertyValue(name).trim();
@@ -37,8 +42,11 @@ let snap = null;       // last parsed snapshot
 let playing = false;
 let speed = 2;
 let acc = 0;           // fractional ticks not yet run
-let actions = [];      // [tick, code], in order
-let pending = [];      // actions still to replay, from a shared link
+let seed = 0;
+let actions = [];      // [tick, code] applied on this branch, in order
+let pending = [];      // recorded actions still ahead of now (replay or after scrubbing back)
+let events = [];       // the engine's events, mirrored incrementally
+let ghost = null;      // after scrubbing back: {events, head} of the recorded run ahead
 let splitMode = null;  // Set of server ids on side A while choosing
 const angle = new Map();       // server id -> current drawn angle
 const lastCommitted = new Map(); // server id -> highest committed index drawn
@@ -46,36 +54,50 @@ const lastLogSig = new Map();
 let lastOpsSig = '';
 let localErrors = [];  // console lines the engine never saw (parse errors)
 let view = { w: 0, h: 0, dpr: 1 };
+let tlView = { w: 0, h: 0, dpr: 1 };
 
 // ---------------------------------------------------------------- engine --
 
 function parseHash() {
   const h = new URLSearchParams(location.hash.slice(1));
-  const seed = Number.parseInt(h.get('seed') ?? '', 10);
+  const s = Number.parseInt(h.get('seed') ?? '', 10);
   let run = [];
   try { run = JSON.parse(h.get('run') ?? '[]'); } catch { run = []; }
   if (!Array.isArray(run)) run = [];
   return {
-    seed: Number.isFinite(seed) && seed >= 0 && seed < 1e9 ? seed : null,
+    seed: Number.isFinite(s) && s >= 0 && s < 1e9 ? s : null,
     run: run.filter(a => Array.isArray(a) && a.length === 2 && Number.isInteger(a[0]) && typeof a[1] === 'string'),
   };
 }
 
+// The whole recording of this branch: what happened plus what is still ahead.
+function recording() { return actions.concat(pending); }
+
 function writeHash() {
-  const p = new URLSearchParams({ seed: String(sim.seed()) });
-  if (actions.length) p.set('run', JSON.stringify(actions));
+  const p = new URLSearchParams({ seed: String(seed) });
+  const run = recording();
+  if (run.length) p.set('run', JSON.stringify(run));
   history.replaceState(null, '', '#' + p.toString());
 }
 
-function reset(seed, replay = []) {
+// A fresh engine for `s`, with `replay` scheduled. Nothing runs yet.
+function rebuild(s, replay) {
   if (sim) sim.delete();
-  sim = Q.create(seed, SERVERS);
+  seed = s;
+  sim = Q.create(s, SERVERS);
   actions = [];
   pending = replay.slice().sort((a, b) => a[0] - b[0]);
-  angle.clear(); lastCommitted.clear(); lastLogSig.clear(); lastOpsSig = ''; localErrors = [];
+  events = [];
+  lastCommitted.clear(); lastLogSig.clear(); lastOpsSig = '';
   acc = 0;
+}
+
+function reset(s, replay = []) {
+  rebuild(s, replay);
+  ghost = null;
+  angle.clear(); localErrors = [];
   cancelSplit();
-  $('seed').value = String(seed);
+  $('seed').value = String(s);
   applyDue();
   refresh();
   writeHash();
@@ -89,6 +111,8 @@ function perform(code) {
   if (kind === 'r') return sim.restart(Number(arg));
   if (kind === 'p') return sim.partition(arg);
   if (kind === 'h') { sim.heal(); return true; }
+  if (kind === 'l') { sim.setLoad(arg === '1'); return true; }
+  if (kind === 'x') return sim.startChaos();
   if (kind === 's') {
     const [op, key, value] = arg.split(':').map(decodeURIComponent);
     return sim.submit(1, op, key, value ?? '') > 0;
@@ -96,13 +120,13 @@ function perform(code) {
   return false;
 }
 
-// A user action: drops whatever was left to replay, then records it.
+// A user action. Whatever was recorded ahead of now is dropped: this starts a
+// new branch from the current moment.
 function act(code) {
   pending = [];
-  if (perform(code)) {
-    actions.push([sim.now(), code]);
-    writeHash();
-  }
+  ghost = null;
+  if (perform(code)) actions.push([sim.now(), code]);
+  writeHash();
   refresh();
 }
 
@@ -113,7 +137,7 @@ function applyDue() {
   }
 }
 
-// Advances n ticks, stopping at every replayed action's tick.
+// Advances n ticks, stopping at every recorded action's tick.
 function advance(n) {
   while (n > 0) {
     applyDue();
@@ -125,11 +149,40 @@ function advance(n) {
   applyDue();
 }
 
+// The furthest tick this branch has reached.
+function head() { return Math.max(sim.now(), ghost ? ghost.head : 0); }
+
+// Shows exactly tick t: forward by running on, backward by rebuilding from
+// the seed and replaying the recording up to t.
+function scrubTo(t) {
+  t = Math.max(0, Math.min(Math.round(t), head()));
+  if (t === sim.now()) return;
+  setPlaying(false);
+  if (!ghost) ghost = { events: events.slice(), head: sim.now() };
+  if (t < sim.now()) {
+    const run = recording();
+    rebuild(seed, run);
+  }
+  advance(t - sim.now());
+  refresh();
+}
+
+function fetchEvents() {
+  const r = JSON.parse(sim.eventsJson(events.length));
+  if (r.first > events.length) events.length = 0;  // the engine dropped old ones
+  for (const e of r.events) events.push(e);
+  // Past the end of the old recording: nothing is left to retrace.
+  if (ghost && sim.now() >= ghost.head && pending.length === 0) ghost = null;
+}
+
 function refresh() {
   snap = JSON.parse(sim.snapshot());
+  fetchEvents();
   renderLogs();
   renderConsole();
   renderStatus();
+  renderMetrics();
+  tlDirty = true;
 }
 
 // ---------------------------------------------------------------- layout --
@@ -412,7 +465,10 @@ function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
 
 function renderConsole() {
   const ops = snap.ops.filter(o => o.client === 1);
-  const sig = JSON.stringify([ops, localErrors]);
+  const chaos = snap.chaos;
+  const left = chaos && chaos.phase === 'running'
+    ? Math.max(0, Math.ceil((chaos.end - snap.now) / snap.metrics.ticksPerSecond)) : 0;
+  const sig = JSON.stringify([ops, localErrors, chaos, left]);
   if (sig === lastOpsSig) return;
   lastOpsSig = sig;
   const out = $('out');
@@ -435,11 +491,40 @@ function renderConsole() {
     return { at: o.invoked ?? Infinity, html: `<li class="${cls}"><div class="cmdline">${esc(cmd)}</div><div class="reply">${esc(reply)}</div>${meta ? `<div class="meta">${esc(meta)}</div>` : ''}</li>` };
   });
   for (const e of localErrors) items.push({ at: e.at, html: `<li class="error"><div class="cmdline">${esc(e.line)}</div><div class="reply">${esc(e.msg)}</div></li>` });
+  if (chaos) {
+    const secs = Math.round((chaos.end - chaos.start) / snap.metrics.ticksPerSecond);
+    let reply, cls = 'check', detail = '';
+    if (chaos.phase === 'running') {
+      reply = `running: ${left} s left`;
+    } else if (chaos.phase === 'settling') {
+      reply = 'healing and waiting for the clients to finish…';
+    } else if (chaos.verdict === 'linearizable') {
+      reply = `${chaos.ops} operations, linearizable ✓`;
+      cls += ' ok';
+    } else {
+      reply = `${chaos.ops} operations, ${chaos.verdict}`;
+      cls += ' bad';
+      detail = `<pre>${esc(chaos.explanation)}</pre>`;
+    }
+    items.push({ at: chaos.start, html: `<li class="${cls}" id="chaosResult"><div class="cmdline">chaos for ${secs} simulated seconds</div><div class="reply">${esc(reply)}</div>${detail}</li>` });
+  }
   items.sort((a, b) => a.at - b.at);
   out.innerHTML = items.length
     ? items.map(i => i.html).join('')
     : '<li class="empty">Try <b>put x 1</b>, then <b>get x</b>. Commands go through a client that finds the leader, follows redirects and retries on timeouts.</li>';
   out.scrollTop = out.scrollHeight;
+}
+
+function renderMetrics() {
+  const m = snap.metrics;
+  const secs = t => (t / m.ticksPerSecond).toFixed(1) + ' s';
+  $('mWrites').textContent = m.writesPerSec.toFixed(1);
+  $('mLatency').textContent = m.p50 === null ? '–' : `${m.p50} / ${m.p99} ticks`;
+  $('mLatency').title = `over the last ${m.latencyOps} operations; 1 tick = ${1000 / m.ticksPerSecond} ms`;
+  $('mElections').textContent = String(m.elections);
+  $('mLeaderless').textContent = secs(m.leaderlessTicks);
+  $('mLeaderless').title = 'simulated time with no leader that can reach a majority';
+  $('load').checked = snap.load;
 }
 
 function renderStatus() {
@@ -449,6 +534,161 @@ function renderStatus() {
   const split = partitioned(snap.nodes);
   $('heal').disabled = !split;
   $('split').disabled = !!splitMode;
+  const busy = snap.chaos && snap.chaos.phase !== 'done';
+  $('chaos').disabled = !!busy;
+  $('chaos').textContent = !busy ? 'Chaos'
+    : snap.chaos.phase === 'running' ? `Chaos: ${Math.max(0, Math.ceil((snap.chaos.end - snap.now) / snap.metrics.ticksPerSecond))} s`
+    : 'Checking…';
+  const t = sim.now();
+  $('tlTime').textContent = `t = ${t} (${(t / snap.metrics.ticksPerSecond).toFixed(1)} s)` +
+    (t < head() ? ` · viewing the past, recorded to ${head()}` : '');
+  $('live').hidden = !(t < head());
+}
+
+// ---------------------------------------------------------------- timeline --
+
+let tlDirty = true;
+let tlFollow = true;   // keep the cursor in view while it moves
+const tl = $('tl');
+const tlCtx = tl.getContext('2d');
+const tlScroll = $('tlScroll');
+
+const EVENT_STYLE = {
+  elect: { lane: 0, color: () => C.accent },
+  crash: { lane: 0, color: () => C.ink },
+  restart: { lane: 0, color: () => C.soft },
+  split: { lane: 0, color: () => C.client },
+  heal: { lane: 0, color: () => C.client },
+  chaos: { lane: 0, color: () => C.vote },
+  check: { lane: 0, color: () => C.append },
+  op: { lane: 1, color: () => C.client },
+};
+
+function tlResize() {
+  const r = tlScroll.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  tlView = { w: r.width, h: 58, dpr };
+  tl.style.width = r.width + 'px';
+  tl.width = Math.round(r.width * dpr);
+  tl.height = Math.round(58 * dpr);
+  tlDirty = true;
+}
+
+function tlTotalWidth() { return Math.max(tlView.w, (head() + 400) * TL_SCALE); }
+
+// Spans (split..heal, chaos) as [start, end] pairs over a list of events.
+function spans(list, open, close, until) {
+  const out = [];
+  let start = null;
+  for (const e of list) {
+    if (e.kind === open && (open !== 'chaos' || e.text.startsWith('Chaos started'))) { if (start === null) start = e.t; }
+    else if (start !== null && e.kind === close && (close !== 'chaos' || !e.text.startsWith('Chaos started'))) { out.push([start, e.t]); start = null; }
+  }
+  if (start !== null) out.push([start, until]);
+  return out;
+}
+
+function drawTimeline() {
+  if (!snap || tlView.w === 0) return;
+  $('tlSpacer').style.width = tlTotalWidth() + 'px';
+  const now = sim.now();
+  if (tlFollow) {
+    const x = now * TL_SCALE;
+    if (x < tlScroll.scrollLeft + 20 || x > tlScroll.scrollLeft + tlView.w - 40)
+      tlScroll.scrollLeft = Math.max(0, x - tlView.w * 0.75);
+  }
+  const off = tlScroll.scrollLeft;
+  const { w, h, dpr } = tlView;
+  const c = tlCtx;
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.clearRect(0, 0, w, h);
+  const X = t => t * TL_SCALE - off;
+  const tps = snap.metrics.ticksPerSecond;
+  const first = Math.floor(off / TL_SCALE), last = Math.ceil((off + w) / TL_SCALE);
+
+  // Past events are the engine's; events ahead of now come from the recording.
+  const future = ghost ? ghost.events.filter(e => e.t > now) : [];
+  const all = events.concat(future);
+  const end = head();
+
+  // Bands: network splits and chaos runs.
+  for (const [a, b] of spans(all, 'split', 'heal', end)) {
+    c.fillStyle = 'rgba(111, 168, 200, .13)';
+    c.fillRect(X(a), 14, (b - a) * TL_SCALE, 18);
+  }
+  for (const [a, b] of spans(all, 'chaos', 'check', end)) {
+    c.fillStyle = 'rgba(224, 169, 59, .16)';
+    c.fillRect(X(a), 14, (b - a) * TL_SCALE, 36);
+  }
+
+  // Ruler: a mark every second, labels every 10 seconds.
+  c.fillStyle = C.soft;
+  c.font = '10.5px "IBM Plex Sans", system-ui, sans-serif';
+  c.textBaseline = 'top';
+  c.textAlign = 'left';
+  for (let t = Math.floor(first / tps) * tps; t <= last; t += tps) {
+    const big = t % (10 * tps) === 0;
+    c.fillStyle = big ? C.soft : C.line;
+    c.fillRect(Math.round(X(t)), 0, 1, big ? 6 : 3);
+    if (big) c.fillText(`${t / tps} s`, X(t) + 3, 0);
+  }
+
+  // Events.
+  for (const e of all) {
+    if (e.t < first - 50 || e.t > last + 50) continue;
+    const st = EVENT_STYLE[e.kind] ?? EVENT_STYLE.op;
+    const x = X(e.t);
+    c.globalAlpha = e.t > now ? 0.35 : 1;
+    c.fillStyle = st.color();
+    c.strokeStyle = st.color();
+    if (st.lane === 1) {
+      c.fillRect(Math.round(x), 40, 1, 8);
+    } else if (e.kind === 'elect') {
+      c.beginPath(); c.moveTo(x, 17); c.lineTo(x + 4, 25); c.lineTo(x - 4, 25); c.closePath(); c.fill();
+    } else if (e.kind === 'crash') {
+      c.lineWidth = 1.5;
+      c.beginPath(); c.moveTo(x - 3, 18); c.lineTo(x + 3, 24); c.moveTo(x + 3, 18); c.lineTo(x - 3, 24); c.stroke();
+    } else if (e.kind === 'restart') {
+      c.lineWidth = 1.5;
+      c.beginPath(); c.arc(x, 21, 3, 0, Math.PI * 2); c.stroke();
+    } else if (e.kind === 'check') {
+      c.lineWidth = 2;
+      c.beginPath(); c.moveTo(x - 4, 21); c.lineTo(x - 1, 24); c.lineTo(x + 4, 17); c.stroke();
+    } else {
+      c.fillRect(Math.round(x), 14, 1.5, 18);
+    }
+  }
+  c.globalAlpha = 1;
+
+  // The recorded run ahead of the cursor is dimmed; the cursor is the accent.
+  if (end > now) {
+    c.fillStyle = 'rgba(251, 244, 233, .5)';
+    c.fillRect(X(now), 12, (end - now) * TL_SCALE, h - 12);
+  }
+  const cx = Math.round(X(now)) + 0.5;
+  c.strokeStyle = C.accent;
+  c.lineWidth = 2;
+  c.beginPath(); c.moveTo(cx, 10); c.lineTo(cx, h); c.stroke();
+  c.fillStyle = C.accent;
+  c.beginPath(); c.arc(cx, 10, 4, 0, Math.PI * 2); c.fill();
+  tlDirty = false;
+}
+
+function tlTickAt(clientX) {
+  const r = tl.getBoundingClientRect();
+  return (clientX - r.left + tlScroll.scrollLeft) / TL_SCALE;
+}
+
+function tlEventNear(clientX) {
+  const t = tlTickAt(clientX);
+  const now = sim.now();
+  const all = events.concat(ghost ? ghost.events.filter(e => e.t > now) : []);
+  let best = null, bestD = 4 / TL_SCALE;
+  for (const e of all) {
+    const d = Math.abs(e.t - t);
+    if (d < bestD && (e.kind !== 'op' || !best)) { best = e; bestD = d; }
+  }
+  return best;
 }
 
 // ---------------------------------------------------------------- input --
@@ -461,7 +701,9 @@ function setPlaying(p) {
 function setSpeed(i) {
   speed = i;
   $('speed').value = String(i);
-  $('speedLabel').textContent = `${SPEED_NAMES[i]}, ${SPEEDS[i]}/s`;
+  $('speedLabel').textContent = `${SPEEDS[i]}/s`;
+  $('speedLabel').title = `${SPEED_NAMES[i]}: ${SPEEDS[i]} ticks per second`;
+  $('speed').setAttribute('aria-valuetext', `${SPEED_NAMES[i]}, ${SPEEDS[i]} ticks per second`);
 }
 
 function startSplit() {
@@ -529,6 +771,7 @@ function bind() {
   $('heal').onclick = () => act('h');
   $('reset').onclick = () => {
     const v = Number.parseInt($('seed').value, 10);
+    tlFollow = true;
     reset(Number.isFinite(v) && v >= 0 && v < 1e9 ? v : randomSeed());
   };
   $('seed').onkeydown = e => { if (e.key === 'Enter') $('reset').click(); };
@@ -548,6 +791,43 @@ function bind() {
     $('line').value = '';
   };
   $('start').onclick = () => { $('intro').hidden = true; setPlaying(true); };
+  $('load').onchange = e => act(e.target.checked ? 'l1' : 'l0');
+  $('chaos').onclick = () => {
+    act('x');
+    if (speed < 3) setSpeed(3);  // 60 simulated seconds take a minute at "fast"
+    setPlaying(true);
+  };
+  $('live').onclick = () => { tlFollow = true; scrubTo(head()); setPlaying(true); };
+
+  // Timeline: drag to scrub, arrow keys to step, scroll to look around.
+  let dragging = false, want = null;
+  const scrubSoon = t => {
+    if (want === null) requestAnimationFrame(() => { scrubTo(want); want = null; });
+    want = t;
+  };
+  tl.addEventListener('pointerdown', e => {
+    dragging = true;
+    tlFollow = true;
+    tl.setPointerCapture(e.pointerId);
+    scrubSoon(tlTickAt(e.clientX));
+  });
+  tl.addEventListener('pointermove', e => {
+    if (dragging) { scrubSoon(tlTickAt(e.clientX)); return; }
+    const ev = tlEventNear(e.clientX);
+    tl.title = ev ? `t=${ev.t}: ${ev.text}` : 'Drag to go back to any moment';
+  });
+  const stop = () => { dragging = false; };
+  tl.addEventListener('pointerup', stop);
+  tl.addEventListener('pointercancel', stop);
+  tlScroll.addEventListener('scroll', () => { tlDirty = true; if (!dragging) tlFollow = false; });
+  tlScroll.addEventListener('keydown', e => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    tlFollow = true;
+    const step = (e.shiftKey ? 100 : 1) * (e.key === 'ArrowLeft' ? -1 : 1);
+    scrubTo(sim.now() + step);
+  });
+  new ResizeObserver(tlResize).observe(tlScroll);
 
   canvas.addEventListener('click', e => {
     const r = canvas.getBoundingClientRect();
@@ -589,6 +869,7 @@ function frame(t) {
     if (n > 0) { advance(n); refresh(); }
   }
   draw(dt);
+  if (tlDirty) drawTimeline();
   requestAnimationFrame(frame);
 }
 
@@ -611,6 +892,15 @@ async function main() {
   // check that a shared link replays a run exactly).
   window.quorum = {
     snapshot: () => snap,
+    events: () => events,
+    head,
+    // Where tick t is drawn on the timeline, in page coordinates (null if
+    // scrolled out of view).
+    timelineX: t => {
+      const r = tl.getBoundingClientRect();
+      const x = r.left + t * TL_SCALE - tlScroll.scrollLeft;
+      return x < r.left || x > r.right ? null : { x, y: r.top + r.height / 2 };
+    },
     runTo: t => {
       setPlaying(false);
       if (t > sim.now()) advance(t - sim.now());
