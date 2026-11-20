@@ -23,6 +23,7 @@ std::size_t KvClient::submit(Op op, std::string key, std::string value,
     if (!idle()) throw std::logic_error("KvClient::submit: an operation is outstanding");
     op_ = Command{client_id_, ++seq_, op, std::move(key), std::move(value), std::move(expected)};
     op_index_ = history_.invoke(*op_, now_());
+    op_stats_ = {};
     send_now();
     return op_index_;
 }
@@ -40,6 +41,7 @@ void KvClient::send_now() {
     elapsed_ = 0;
     backing_off_ = false;
     ++stats_.sends;
+    ++op_stats_.sends;
     send_(target_, encode_request(*op_));
 }
 
@@ -52,6 +54,7 @@ void KvClient::tick() {
     }
     if (elapsed_ >= config_.retry_timeout) {
         ++stats_.timeouts;
+        ++op_stats_.timeouts;
         hint_ = random_server_except(target_);  // the target failed us: try elsewhere
         send_now();
     }
@@ -66,10 +69,13 @@ void KvClient::on_message(const sim::Message& m) {
         op_.reset();
         // Whoever answered is a good guess for the next request.
         hint_ = m.from;
+        answered_by_ = m.from;
         ++stats_.completed;
+        ++op_stats_.completed;
         return;
     }
     ++stats_.redirects;
+    ++op_stats_.redirects;
     const auto& hint = std::get<Redirect>(rep->body).leader_hint;
     if (hint && *hint != target_) {
         hint_ = hint;

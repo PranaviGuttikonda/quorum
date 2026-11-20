@@ -114,6 +114,8 @@ public:
     const std::vector<NodeId>& ids() const { return ids_; }
     Tick now() const { return net_.now(); }
     const sim::SimNetwork& network() const { return net_; }
+    // See SimNetwork::clear_trace.
+    void clear_trace() { net_.clear_trace(); }
     StorageProvider& storage() const { return *storage_; }
     // Entries `id` has removed by conflict truncation, over all incarnations.
     std::uint64_t truncated_entries(NodeId id) const;

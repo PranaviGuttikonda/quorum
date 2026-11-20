@@ -89,6 +89,8 @@ public:
     // The leader this node currently follows, if it knows of one this term.
     std::optional<NodeId> leader_id() const { return leader_id_; }
     Tick election_timeout() const { return election_timeout_; }
+    // Ticks since the election timer was last reset (meaningless for a leader).
+    Tick election_elapsed() const { return election_elapsed_; }
     std::size_t cluster_size() const { return peers_.size() + 1; }
 
     const std::vector<LogEntry>& log() const { return log_; }
