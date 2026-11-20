@@ -4,7 +4,12 @@
 //           clicks and typing, at 1280x800 and 390x844:
 //             start, wait for a leader, crash it by clicking it, wait for a
 //             new leader, put and get through the console, split the network
-//             and heal it.
+//             and heal it; scrub the timeline back and forward (the state at a
+//             tick must match what was there before, exactly), branch from the
+//             past, run the load generator, and run chaos until the
+//             linearizability result appears.
+//           With --og <file>, the desktop run also saves a 1200x630 link
+//           preview image of the split network.
 //           Each step waits on what the engine reports (window.quorum
 //           snapshot). Screenshots go to the output directory. The script
 //           fails on any page error, and prints the bytes transferred.
@@ -18,7 +23,10 @@ import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
-const [siteDir, outDir = 'screenshots'] = process.argv.slice(2);
+const args = process.argv.slice(2);
+const ogAt = args.indexOf('--og');
+const ogFile = ogAt >= 0 ? args.splice(ogAt, 2)[1] : null;
+const [siteDir, outDir = 'screenshots'] = args;
 if (!siteDir) {
   console.error('usage: node scripts/web_smoke.mjs <site dir> [screenshot dir]');
   process.exit(2);
@@ -187,19 +195,43 @@ async function run(name, width, height, mobile) {
   console.log(`  get x -> "${get.result}" from S${get.server} in ${get.completed - get.invoked} ticks`);
   await shot('4-console');
 
+  // A moment to come back to: pause, remember it exactly, play on.
+  await clickEl('play');
+  const t1 = await evaluate(snap('s.now'));
+  const s1 = await evaluate(`JSON.stringify(window.quorum.snapshot())`);
+  await clickEl('play');
+
   await clickEl('split');
   await until('the split panel', `!document.getElementById('splitPanel').hidden`, 3000);
   await clickEl('applySplit');
   await until('the partition', snap('s.nodes.some(n => n.group !== 0)'), 3000);
   await sleep(1500);
   await shot('5-split');
+  if (ogFile && !mobile) {
+    // The link preview: the same page at 1200x630, cluster and console only.
+    await evaluate(`(() => {
+      for (const sel of ['.logs', '.timeline']) document.querySelector(sel).style.display = 'none';
+      document.querySelector('.layout').style.minHeight = '0';
+    })()`);
+    await S('Emulation.setDeviceMetricsOverride', { width: 1200, height: 630, deviceScaleFactor: 1, mobile: false });
+    await sleep(900);
+    const { data } = await S('Page.captureScreenshot', { format: 'png' });
+    writeFileSync(ogFile, Buffer.from(data, 'base64'));
+    console.log(`  ${ogFile} (1200x630)`);
+    await evaluate(`(() => {
+      for (const sel of ['.logs', '.timeline']) document.querySelector(sel).style.display = '';
+      document.querySelector('.layout').style.minHeight = '';
+    })()`);
+    await S('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 2, mobile });
+    await sleep(500);
+  }
   await clickEl('heal');
   await until('the heal', snap('s.nodes.every(n => n.group === 0)'), 3000);
   await clickServer(first);  // restart the crashed server
   await until(`S${first} to restart`, snap(`s.nodes[${first - 1}].up`), 5000);
   await until('a stable leader after healing', snap('s.leader !== null'));
   await sleep(2500);
-  await shot('6-healed');
+  await shot('5b-healed');
 
   // The copied link must replay this run exactly: same seed, same actions at
   // the same ticks, so the same snapshot at the same tick.
@@ -222,6 +254,78 @@ async function run(name, width, height, mobile) {
     else console.log(`  shared link replays exactly: ${actions} actions, identical snapshot at t=${t}`);
     await send('Target.closeTarget', { targetId: replay.targetId });
   }
+
+  // Timeline: scrub back to t1 and forward to the head. Both must show
+  // exactly the state that was there.
+  const key = async (k, code) => {
+    await S('Input.dispatchKeyEvent', { type: 'keyDown', key: k, code: k, windowsVirtualKeyCode: code });
+    await S('Input.dispatchKeyEvent', { type: 'keyUp', key: k, code: k, windowsVirtualKeyCode: code });
+  };
+  const scrubTimeline = async target => {
+    await evaluate(`document.getElementById('tlScroll').scrollIntoView({block: 'center'})`);
+    let p = null;
+    for (let i = 0; i < 40 && !p; ++i) {
+      p = await evaluate(`window.quorum.timelineX(${target})`);
+      if (p) break;
+      const r = await evaluate(`(() => { const b = document.getElementById('tl').getBoundingClientRect(); return {x: b.x + b.width / 2, y: b.y + b.height / 2}; })()`);
+      const centre = await evaluate(`(document.getElementById('tlScroll').scrollLeft + document.getElementById('tl').getBoundingClientRect().width / 2) / 0.25`);
+      await S('Input.dispatchMouseEvent', { type: 'mouseWheel', x: r.x, y: r.y, deltaX: target < centre ? -300 : 300, deltaY: 0 });
+      await sleep(60);
+    }
+    if (!p) throw new Error(`${name}: tick ${target} never scrolled into view`);
+    await click(p.x, p.y);  // drag starts (and here ends) where it lands
+    await sleep(200);
+    for (let i = 0; i < 40; ++i) {  // then arrow keys to the exact tick
+      const now = await evaluate(snap('s.now'));
+      if (now === target) return;
+      await key(now > target ? 'ArrowLeft' : 'ArrowRight', now > target ? 37 : 39);
+      await sleep(30);
+    }
+    throw new Error(`${name}: could not scrub to ${target}`);
+  };
+  await clickEl('play');  // pause
+  const tHead = await evaluate(snap('s.now'));
+  const sHead = await evaluate(`JSON.stringify(window.quorum.snapshot())`);
+  await scrubTimeline(t1);
+  if (await evaluate(`JSON.stringify(window.quorum.snapshot())`) !== s1) errors.push(`scrubbing back to t=${t1} showed a different state`);
+  if (!(await evaluate(`!document.getElementById('live').hidden`))) errors.push('no way back to live after scrubbing');
+  await shot('6-scrubbed-back');
+  await scrubTimeline(tHead);
+  if (await evaluate(`JSON.stringify(window.quorum.snapshot())`) !== sHead) errors.push(`scrubbing forward to t=${tHead} showed a different state`);
+  console.log(`  scrubbed back to t=${t1} and forward to t=${tHead}: both identical to the original run`);
+
+  // A new action in the past starts a new branch there.
+  await scrubTimeline(t1);
+  const victim = await evaluate(snap('s.nodes.find(n => n.up && n.id !== s.leader).id'));
+  await clickServer(victim);
+  const branch = await evaluate(`(() => {
+    const run = JSON.parse(new URLSearchParams(location.hash.slice(1)).get('run') ?? '[]');
+    return { head: window.quorum.head(), now: window.quorum.snapshot().now, last: run[run.length - 1], ahead: run.filter(a => a[0] > ${t1}).length };
+  })()`);
+  if (branch.head !== t1 || branch.ahead !== 0 || branch.last[1] !== 'c' + victim)
+    errors.push(`no new branch at t=${t1}: ${JSON.stringify(branch)}`);
+  else console.log(`  crashing S${victim} at t=${t1} started a new branch there`);
+  await clickServer(victim);  // restart it
+
+  // Load generator, then chaos at the fastest speed until the check reports.
+  await clickEl('loadSwitch');
+  await until('the load switch', snap('s.load'), 3000);
+  await clickEl('play');
+  await until('generated writes', snap('s.metrics.writesPerSec > 0'), 30000);
+  await clickEl('loadSwitch');
+  await until('the load to stop', snap('!s.load'), 3000);
+  const sliderEnd = await evaluate(`(() => { const b = document.getElementById('speed').getBoundingClientRect(); return {x: b.right - 2, y: b.y + b.height / 2}; })()`);
+  await click(sliderEnd.x, sliderEnd.y);
+  await clickEl('chaos');
+  await until('chaos to start', snap(`s.chaos && s.chaos.phase === 'running'`), 5000);
+  await sleep(4000);
+  await shot('7-chaos');
+  await until('the chaos check', snap(`s.chaos && s.chaos.phase === 'done'`), 180000);
+  const verdict = await evaluate(`document.getElementById('chaosResult').innerText`);
+  if (!/operations, linearizable ✓/.test(verdict)) errors.push(`chaos result: ${verdict}`);
+  else console.log(`  chaos: ${verdict.replace(/\s+/g, ' ').trim()}`);
+  await evaluate(`document.getElementById('chaosResult').scrollIntoView({block: 'nearest'})`);
+  await shot('8-chaos-result');
 
   const overflow = await evaluate(`document.documentElement.scrollWidth > window.innerWidth`);
   if (overflow) errors.push('horizontal overflow');
