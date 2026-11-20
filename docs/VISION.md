@@ -35,7 +35,8 @@ replayed exactly from its seed.
 5. **Persistence** *(durable storage and crash recovery done; snapshots and log
    compaction not started)*: durable term, vote and log through a storage interface, a simulated
    disk with crash-consistency faults, and snapshots with log compaction.
-6. **Visualizer** *(current: a live browser view of the real engine in WebAssembly)*: export simulation traces and step through a run to see elections,
+6. **Visualizer** *(current: the real engine in WebAssembly, with a scrubbable timeline,
+   metrics, a load generator and a chaos mode checked for linearizability)*: export simulation traces and step through a run to see elections,
    replication and faults over time.
 7. **Benchmarks**: throughput and latency under varying cluster sizes, delays and loss
    rates, plus a real-network transport for comparison.

@@ -11,7 +11,9 @@ A Raft-based replicated key-value store in C++20, tested with deterministic simu
 
 **Try it:** [pranaviguttikonda.github.io/quorum](https://pranaviguttikonda.github.io/quorum/) runs the real
 engine in your browser, compiled to WebAssembly. Crash servers, split the network and send
-commands while you watch elections, replication and commits happen.
+commands while you watch elections, replication and commits happen. Drag the timeline back
+to any earlier moment, or press Chaos for a minute of random failures under load, followed
+by a linearizability check of everything the clients saw.
 
 ![The visualizer during a network split](docs/screenshots/desktop-5-split.png)
 
@@ -70,7 +72,11 @@ python3 -m http.server -d build-web/site 8000  # then open http://localhost:8000
 ```
 
 A run's seed and every action you take are kept in the URL, so "Copy link" replays the run
-exactly. CI checks that the WebAssembly build prints the same scenario trace as the native
+exactly. The same recording drives the timeline: scrubbing back rebuilds the engine from the
+seed and replays the actions up to that tick, and a new action from there starts a new
+branch. The load generator and chaos mode run inside the engine on seeded streams, so they
+replay too. When chaos ends, the page runs the same linearizability checker as the fuzz tests
+on the whole client history. CI checks that the WebAssembly build prints the same scenario trace as the native
 build, then uses the page in headless Chrome (`scripts/web_smoke.mjs`). Pushes to `main`
 deploy it to GitHub Pages.
 
