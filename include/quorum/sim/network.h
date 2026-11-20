@@ -78,6 +78,15 @@ const char* to_string(EventKind kind);
 const char* to_string(DropReason reason);
 std::string to_string(const TraceEvent& event);
 
+// A message still on the wire, as seen at the current tick.
+struct InFlight {
+    Message msg;
+    bool duplicate = false;  // the second copy of a duplicated message
+    // It will be dropped on arrival as things stand: the receiver is down or
+    // has restarted since it was sent, or a partition now separates the two.
+    bool doomed = false;
+};
+
 class SimNetwork {
 public:
     using Handler = std::function<void(const Message&)>;
@@ -131,7 +140,14 @@ public:
 
     Tick now() const { return clock_.now(); }
     std::size_t in_flight() const { return queue_.size(); }
+    // Every message on the wire, in delivery order.
+    std::vector<InFlight> in_flight_messages() const;
+    // The partition group of `id`: 0 when unlisted or after heal().
+    std::uint32_t group_of(NodeId id) const { return node(id).group; }
     const std::vector<TraceEvent>& trace() const { return trace_; }
+    // Long-running hosts (the visualizer) read the trace and then drop it, so
+    // it doesn't grow without bound. Stats are unaffected.
+    void clear_trace() { trace_.clear(); }
     const NetworkStats& stats() const { return stats_; }
 
 private:

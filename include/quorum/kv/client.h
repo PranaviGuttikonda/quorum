@@ -62,6 +62,11 @@ public:
     // Result of the most recently completed operation.
     const std::optional<Result>& last_result() const { return last_result_; }
     const ClientStats& stats() const { return stats_; }
+    // The same counters for the current operation, or the last one once it
+    // completes. `completed` is 1 once it has.
+    const ClientStats& op_stats() const { return op_stats_; }
+    // The server whose Result completed the last operation.
+    std::optional<NodeId> answered_by() const { return answered_by_; }
 
 private:
     void send_now();
@@ -85,6 +90,8 @@ private:
     bool backing_off_ = false;
     std::optional<Result> last_result_;
     ClientStats stats_;
+    ClientStats op_stats_;
+    std::optional<NodeId> answered_by_;
 };
 
 }  // namespace quorum::kv
