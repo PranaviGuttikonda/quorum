@@ -463,32 +463,83 @@ function renderLogs() {
 
 function plural(n, word) { return `${n} ${word}${n === 1 ? '' : 's'}`; }
 
+// One line per send of an operation, from what the engine reported about it:
+// where it went, how it ended, and what the network did with the request.
+function attemptLine(a, o, last) {
+  const S = `S${a.server}`;
+  const tps = snap.metrics.ticksPerSecond;
+  const late = a.late ? ' (the answer came late)' : '';
+  switch (a.outcome) {
+    case 'in-flight': {
+      const wait = `retry in ${(Math.max(0, a.retryAt - snap.now) / tps).toFixed(1)} s`;
+      if (!a.upNow) return `→ ${S}: no answer (${S} is crashed), ${wait}`;
+      if (a.request === 'dropped') return `→ ${S}: request lost, ${wait}`;
+      if (a.request === 'delivered' && a.role === 'leader') return `→ ${S}: waiting for it to commit… (${wait})`;
+      return `→ ${S}: waiting… (${wait})`;
+    }
+    case 'timeout': {
+      let why = 'no answer';
+      if (a.request === 'dropped') {
+        why = a.dropReason === 'receiver-down' ? `${S} was crashed`
+          : a.dropReason === 'partition' ? `${S} was cut off by the split` : 'the request was lost';
+      } else if (a.request === 'delivered') {
+        why = a.upAtEnd === false ? `${S} crashed before answering`
+          : a.role === 'leader' ? `${S} was leader but could not commit` : 'no reply came back';
+      }
+      return `→ ${S}: no answer (${why}), retried${late}`;
+    }
+    case 'redirect':
+      if (a.hint !== null && a.hint !== undefined) return `→ ${S}: not the leader, redirected to S${a.hint}${late}`;
+      return last && o.status === 'running'
+        ? `→ ${S}: no leader known yet, backing off`
+        : `→ ${S}: no leader known yet, backed off and retried${late}`;
+    case 'reply':
+      return `→ ${S}: ${replyText(o)}${late}`;
+    case 'superseded':
+      return `→ ${S}: no answer before another server replied`;
+    default:
+      return `→ ${S}: ${a.outcome}`;
+  }
+}
+
+function replyText(o) {
+  if (o.op === 'get') return o.result === null || o.result === undefined ? 'not found' : `"${o.result}"`;
+  return o.ok === false ? 'failed' : 'ok';
+}
+
+function attemptList(o) {
+  return `<ul class="attempts">${o.attempts.map((a, i) => `<li>${esc(attemptLine(a, o, i === o.attempts.length - 1))}</li>`).join('')}</ul>`;
+}
+
+const openOps = new Set();  // done operations whose attempts are expanded
+
 function renderConsole() {
   const ops = snap.ops.filter(o => o.client === 1);
   const chaos = snap.chaos;
+  const tps = snap.metrics.ticksPerSecond;
   const left = chaos && chaos.phase === 'running'
-    ? Math.max(0, Math.ceil((chaos.end - snap.now) / snap.metrics.ticksPerSecond)) : 0;
-  const sig = JSON.stringify([ops, localErrors, chaos, left]);
+    ? Math.max(0, Math.ceil((chaos.end - snap.now) / tps)) : 0;
+  // Countdowns in attempt lines move in tenths of a second.
+  const clock = ops.some(o => o.status === 'running') ? Math.floor(snap.now / (tps / 10)) : 0;
+  const sig = JSON.stringify([ops, localErrors, chaos, left, clock]);
   if (sig === lastOpsSig) return;
   lastOpsSig = sig;
   const out = $('out');
+  const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
   const items = ops.map(o => {
     const cmd = o.op === 'put' ? `put ${o.key} ${o.value}` : `${o.op} ${o.key}`;
-    let reply, meta = '', cls = '';
+    let body;
     if (o.status === 'queued') {
-      reply = 'queued behind the previous command'; cls = 'pending';
+      body = `<div class="reply">queued behind the previous command</div>`;
     } else if (o.status === 'running') {
-      reply = 'waiting for a reply…'; cls = 'pending';
-      meta = `sent ${plural(o.sends, 'time')} so far, started at t=${o.invoked}`;
+      body = `<div class="reply">waiting for a reply…</div>${attemptList(o)}`;
     } else {
-      reply = o.op === 'get' ? (o.result === null ? 'not found' : `"${o.result}"`) : 'ok';
-      const retries = o.sends - 1;
-      const why = [o.redirects && plural(o.redirects, 'redirect'), o.timeouts && plural(o.timeouts, 'timeout')]
-        .filter(Boolean).join(', ');
-      meta = `S${o.server} answered · ${plural(o.completed - o.invoked, 'tick')} · ` +
-        (retries ? `${retries} ${retries === 1 ? 'retry' : 'retries'} (${why})` : 'no retries');
+      const tries = o.attempts.length;
+      const summary = `${replyText(o)} from S${o.server} in ${plural(o.completed - o.invoked, 'tick')}, ${plural(tries, 'try').replace('trys', 'tries')}`;
+      body = `<details data-op="${o.id}"${openOps.has(o.id) ? ' open' : ''}><summary>${esc(summary)}</summary>${attemptList(o)}</details>`;
     }
-    return { at: o.invoked ?? Infinity, html: `<li class="${cls}"><div class="cmdline">${esc(cmd)}</div><div class="reply">${esc(reply)}</div>${meta ? `<div class="meta">${esc(meta)}</div>` : ''}</li>` };
+    const cls = o.status === 'done' ? 'done' : 'pending';
+    return { at: o.invoked ?? Infinity, html: `<li class="${cls}" data-op="${o.id}"><div class="cmdline">${esc(cmd)}</div>${body}</li>` };
   });
   for (const e of localErrors) items.push({ at: e.at, html: `<li class="error"><div class="cmdline">${esc(e.line)}</div><div class="reply">${esc(e.msg)}</div></li>` });
   if (chaos) {
@@ -512,7 +563,7 @@ function renderConsole() {
   out.innerHTML = items.length
     ? items.map(i => i.html).join('')
     : '<li class="empty">Try <b>put x 1</b>, then <b>get x</b>. Commands go through a client that finds the leader, follows redirects and retries on timeouts.</li>';
-  out.scrollTop = out.scrollHeight;
+  if (atBottom) out.scrollTop = out.scrollHeight;
 }
 
 function renderMetrics() {
@@ -785,6 +836,13 @@ function bind() {
     }
     setTimeout(() => { $('share').textContent = 'Copy link'; }, 1600);
   };
+  // Remember which done operations are expanded across re-renders.
+  $('out').addEventListener('toggle', e => {
+    const d = e.target;
+    if (!(d instanceof HTMLDetailsElement)) return;
+    const id = Number(d.dataset.op);
+    if (d.open) openOps.add(id); else openOps.delete(id);
+  }, true);
   $('cmd').onsubmit = e => {
     e.preventDefault();
     submitLine($('line').value);
