@@ -21,16 +21,27 @@ const LOG_ROWS = 6;
 const DROP_MEMORY = 12;                        // matches Simulation::kDropMemory
 const TL_SCALE = 0.25;                         // timeline pixels per tick
 
-const css = getComputedStyle(document.documentElement);
-const color = name => css.getPropertyValue(name).trim();
-const C = {
-  page: color('--page'), card: color('--card'), ink: color('--ink'), soft: color('--ink-soft'),
-  line: color('--line'), accent: color('--accent'), accentSoft: color('--accent-soft'),
-  heartbeat: color('--heartbeat'), vote: color('--vote'), append: color('--append'), client: color('--client'),
+// Every colour and font the canvases use comes from the CSS variables in
+// style.css, re-read whenever the colour scheme changes.
+const C = {};
+const KIND_COLOR = {};
+const THEME_VARS = {
+  page: '--page', card: '--card', ink: '--ink', soft: '--ink-soft', line: '--line', lineStrong: '--line-strong',
+  accent: '--accent', accentInk: '--accent-ink',
+  heartbeat: '--heartbeat', vote: '--vote', append: '--append', client: '--client',
+  nodeFill: '--node-fill', nodeStroke: '--node-stroke', nodeDownFill: '--node-down-fill', nodeDownStroke: '--node-down-stroke',
+  candidateFill: '--candidate-fill', ring: '--ring', timer: '--timer',
+  bandSplit: '--band-split', bandChaos: '--band-chaos', veil: '--veil', sans: '--sans', mono: '--mono',
 };
-const KIND_COLOR = {
-  heartbeat: C.heartbeat, vote: C.vote, append: C.append, request: C.client, reply: C.client, other: C.soft,
-};
+function readTheme() {
+  const css = getComputedStyle(document.documentElement);
+  for (const [k, v] of Object.entries(THEME_VARS)) C[k] = css.getPropertyValue(v).trim();
+  Object.assign(KIND_COLOR, {
+    heartbeat: C.heartbeat, vote: C.vote, append: C.append, request: C.client, reply: C.client, other: C.soft,
+  });
+}
+readTheme();
+const font = (px, family, weight = 400) => `${weight} ${Math.round(px)}px ${family}`;
 
 const $ = id => document.getElementById(id);
 const canvas = $('ring');
@@ -243,7 +254,7 @@ function draw(dt) {
   }
 
   // The ring.
-  ctx.strokeStyle = C.line;
+  ctx.strokeStyle = C.ring;
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.arc(g.cx, g.cy, g.R, 0, Math.PI * 2);
@@ -319,7 +330,7 @@ function drawClient(g) {
   roundRect(x - 13, y - 9, 26, 18, 5);
   ctx.fill(); ctx.stroke();
   ctx.fillStyle = C.soft;
-  ctx.font = '12px "IBM Plex Sans", system-ui, sans-serif';
+  ctx.font = font(12, C.sans);
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   ctx.fillText('client', x + 19, y + 0.5);
@@ -334,7 +345,7 @@ function drawNode(n, g) {
 
   // Election timer: how close a follower or candidate is to starting an election.
   if (n.up && !leader && n.timeout > 0) {
-    ctx.strokeStyle = candidate ? C.vote : C.line;
+    ctx.strokeStyle = candidate ? C.vote : C.timer;
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.arc(x, y, r + 5, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * Math.min(1, n.timer / n.timeout));
@@ -344,17 +355,17 @@ function drawNode(n, g) {
   ctx.beginPath();
   ctx.arc(x, y, r, 0, Math.PI * 2);
   if (!n.up) {
-    ctx.fillStyle = '#F1E8DB';
+    ctx.fillStyle = C.nodeDownFill;
     ctx.fill();
     ctx.setLineDash([4, 4]);
-    ctx.strokeStyle = C.soft;
+    ctx.strokeStyle = C.nodeDownStroke;
     ctx.lineWidth = 1.5;
     ctx.stroke();
     ctx.setLineDash([]);
   } else {
-    ctx.fillStyle = leader ? C.accent : candidate ? '#FFF6E2' : '#FFFFFF';
+    ctx.fillStyle = leader ? C.accent : candidate ? C.candidateFill : C.nodeFill;
     ctx.fill();
-    ctx.strokeStyle = leader ? C.accent : candidate ? C.vote : C.ink;
+    ctx.strokeStyle = leader ? C.accent : candidate ? C.vote : C.nodeStroke;
     ctx.lineWidth = candidate ? 2.5 : 1.5;
     ctx.stroke();
   }
@@ -368,18 +379,26 @@ function drawNode(n, g) {
 
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillStyle = leader ? '#FFFFFF' : n.up ? C.ink : C.soft;
-  ctx.font = `600 ${Math.round(r * 0.5)}px "IBM Plex Sans", system-ui, sans-serif`;
+  ctx.fillStyle = leader ? C.accentInk : n.up ? C.ink : C.soft;
+  ctx.font = font(r * 0.46, C.mono, 600);
   ctx.fillText(`S${n.id}`, x, y - (n.up ? r * 0.12 : 0));
   if (n.up) {
-    ctx.font = `${Math.round(Math.max(10, r * 0.32))}px "IBM Plex Sans", system-ui, sans-serif`;
-    ctx.fillStyle = leader ? 'rgba(255,255,255,.85)' : C.soft;
-    ctx.fillText(`term ${n.term}`, x, y + r * 0.36);
+    // Monospace is wide: shrink "term N" until it fits inside the circle.
+    const label = `term ${n.term}`;
+    let px = Math.max(10, r * 0.3);
+    ctx.font = font(px, C.mono);
+    const fit = r * 1.5;
+    if (ctx.measureText(label).width > fit) {
+      px = Math.max(8, px * fit / ctx.measureText(label).width);
+      ctx.font = font(px, C.mono);
+    }
+    ctx.fillStyle = leader ? C.accentInk : C.soft;
+    ctx.fillText(label, x, y + r * 0.36);
   }
 
   // Role label on the outside of the ring: above servers in the top half,
   // below the others.
-  ctx.font = `${Math.round(Math.max(11, r * 0.36))}px "IBM Plex Sans", system-ui, sans-serif`;
+  ctx.font = font(Math.max(11, r * 0.36), C.sans);
   ctx.fillStyle = leader ? C.accent : C.soft;
   const above = y < g.cy - 1;
   ctx.fillText(n.up ? n.role : 'crashed', x, above ? y - r - 16 : y + r + 18);
@@ -664,17 +683,19 @@ function drawTimeline() {
 
   // Bands: network splits and chaos runs.
   for (const [a, b] of spans(all, 'split', 'heal', end)) {
-    c.fillStyle = 'rgba(111, 168, 200, .13)';
+    c.fillStyle = C.bandSplit;
     c.fillRect(X(a), 14, (b - a) * TL_SCALE, 18);
   }
   for (const [a, b] of spans(all, 'chaos', 'check', end)) {
-    c.fillStyle = 'rgba(224, 169, 59, .16)';
+    c.fillStyle = C.bandChaos;
     c.fillRect(X(a), 14, (b - a) * TL_SCALE, 36);
+    c.fillStyle = C.vote;
+    c.fillRect(X(a), 14, (b - a) * TL_SCALE, 2);
   }
 
   // Ruler: a mark every second, labels every 10 seconds.
   c.fillStyle = C.soft;
-  c.font = '10.5px "IBM Plex Sans", system-ui, sans-serif';
+  c.font = font(10.5, C.mono);
   c.textBaseline = 'top';
   c.textAlign = 'left';
   for (let t = Math.floor(first / tps) * tps; t <= last; t += tps) {
@@ -713,7 +734,7 @@ function drawTimeline() {
 
   // The recorded run ahead of the cursor is dimmed; the cursor is the accent.
   if (end > now) {
-    c.fillStyle = 'rgba(251, 244, 233, .5)';
+    c.fillStyle = C.veil;
     c.fillRect(X(now), 12, (end - now) * TL_SCALE, h - 12);
   }
   const cx = Math.round(X(now)) + 0.5;
@@ -910,6 +931,7 @@ function bind() {
     if (e.key === '.') $('step').click();
   });
   new ResizeObserver(resize).observe(canvas.parentElement);
+  matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { readTheme(); tlDirty = true; });
 }
 
 function randomSeed() { return Math.floor(Math.random() * 1e6); }

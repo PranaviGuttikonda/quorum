@@ -24,7 +24,8 @@ set_target_properties(quorum_web PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${QUORUM_SITE})
 
 set(QUORUM_PAGE_FILES index.html style.css app.js og-image.png
-  fonts/IBMPlexSans-Regular-Latin1.woff2 fonts/IBMPlexSans-SemiBold-Latin1.woff2 fonts/OFL.txt)
+  fonts/IBMPlexSans-Regular-Latin1.woff2 fonts/IBMPlexSans-SemiBold-Latin1.woff2
+  fonts/IBMPlexMono-Regular-Latin1.woff2 fonts/IBMPlexMono-SemiBold-Latin1.woff2 fonts/OFL.txt)
 foreach(f ${QUORUM_PAGE_FILES})
   configure_file(${f} ${QUORUM_SITE}/${f} COPYONLY)
 endforeach()
