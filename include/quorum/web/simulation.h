@@ -37,11 +37,17 @@
 //     on. Then it heals everything, restarts every server, pauses the load,
 //     waits for outstanding operations (up to kChaosSettle ticks), and runs
 //     kv::check_linearizable on the whole history.
+//   - Attempts: every send of a submitted operation (KvClient::attempts),
+//     plus what became of the request on the network, read from the trace:
+//     delivered (and the server's role then) or dropped (and why), and
+//     whether the server was up when the attempt ended. That is what lets the
+//     console say why a retry happened.
 //   Everything is a function of the seed and the calls made at each tick, so
 //   the page re-simulates any earlier moment exactly.
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -111,6 +117,17 @@ public:
         std::optional<NodeId> server;        // who answered
         kv::ClientStats stats;               // sends, timeouts, redirects
         bool generated = false;              // by the load generator
+        std::vector<kv::Attempt> attempts;   // KvClient's record of each send
+        struct Note {
+            enum class Request { Unknown, InFlight, Delivered, Dropped };
+            Request request = Request::Unknown;
+            std::optional<sim::MessageId> msg;
+            Tick at = 0;                     // delivered or dropped at
+            sim::DropReason reason = sim::DropReason::None;
+            std::string role;                // the server's role after it got the request
+            std::optional<bool> up_at_end;   // the server was up when the attempt ended
+        };
+        std::vector<Note> notes;             // parallel to attempts
     };
     struct Event {
         Tick tick = 0;
@@ -175,6 +192,8 @@ private:
     std::size_t first_event_ = 0;
     std::deque<Completion> completions_;
     std::set<raft::Term> led_terms_;
+    // Request messages still on the wire: message -> (operation, attempt).
+    std::map<sim::MessageId, std::pair<std::size_t, std::size_t>> requests_;
     std::uint64_t elections_ = 0;
     Tick leaderless_ = 0;
 };

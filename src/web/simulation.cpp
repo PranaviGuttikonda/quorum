@@ -290,6 +290,53 @@ void Simulation::chaos_step() {
 }
 
 void Simulation::collect() {
+    // The client's own record of each send, for operations still running
+    // (including any that completed during this tick).
+    for (std::size_t c = 0; c < kClients; ++c) {
+        if (!running_[c]) continue;
+        WebOp& op = ops_[*running_[c]];
+        op.attempts = kv_.client(c).attempts();
+        op.notes.resize(op.attempts.size());
+    }
+    // What happened to each request on the wire.
+    const auto& rc = kv_.raft();
+    for (const sim::TraceEvent& e : rc.network().trace()) {
+        if (rc.is_server(e.from) || !rc.is_server(e.to)) continue;  // client requests only
+        if (e.kind == sim::EventKind::Send) {
+            const std::size_t c = e.from - kv::KvCluster::kFirstClientNode;
+            if (c >= kClients || !running_[c]) continue;
+            WebOp& op = ops_[*running_[c]];
+            for (std::size_t i = op.attempts.size(); i-- > 0;) {
+                if (op.attempts[i].server != e.to || op.attempts[i].sent != e.tick || op.notes[i].msg) continue;
+                op.notes[i].msg = e.msg;
+                op.notes[i].request = WebOp::Note::Request::InFlight;
+                requests_[e.msg] = {*running_[c], i};
+                break;
+            }
+            continue;
+        }
+        const auto it = requests_.find(e.msg);
+        if (it == requests_.end() || (e.kind != sim::EventKind::Deliver && e.kind != sim::EventKind::Drop)) continue;
+        WebOp::Note& n = ops_[it->second.first].notes[it->second.second];
+        n.at = e.tick;
+        if (e.kind == sim::EventKind::Deliver) {
+            n.request = WebOp::Note::Request::Delivered;
+            const raft::RaftNode* node = rc.node(e.to);
+            n.role = node ? raft::to_string(node->role()) : "crashed";
+        } else {
+            n.request = WebOp::Note::Request::Dropped;
+            n.reason = e.reason;
+        }
+        requests_.erase(it);
+    }
+    for (std::size_t c = 0; c < kClients; ++c) {
+        if (!running_[c]) continue;
+        WebOp& op = ops_[*running_[c]];
+        for (std::size_t i = 0; i < op.attempts.size(); ++i)
+            if (op.attempts[i].outcome != kv::AttemptOutcome::InFlight && !op.notes[i].up_at_end)
+                op.notes[i].up_at_end = rc.is_up(op.attempts[i].server);
+    }
+
     for (std::size_t c = 0; c < kClients; ++c) {
         if (!running_[c]) continue;
         WebOp& op = ops_[*running_[c]];
@@ -608,11 +655,48 @@ std::string Simulation::snapshot() const {
             j.key("sends").num(w.stats.sends);
             j.key("timeouts").num(w.stats.timeouts);
             j.key("redirects").num(w.stats.redirects);
+            j.key("attempts").raw("[");
+            for (std::size_t a = 0; a < w.attempts.size(); ++a) {
+                const kv::Attempt& at = w.attempts[a];
+                const WebOp::Note& n = w.notes.at(a);
+                j.item().raw("{");
+                j.key("sent").num(at.sent);
+                j.key("server").num(at.server);
+                j.key("outcome").str(kv::to_string(at.outcome));
+                if (at.outcome == kv::AttemptOutcome::Redirect) j.key("hint").opt(at.hint);
+                if (at.outcome == kv::AttemptOutcome::InFlight) {
+                    j.key("retryAt").num(at.sent + kv_.client(w.client - 1).config().retry_timeout);
+                } else {
+                    j.key("ended").num(at.ended);
+                }
+                if (at.late) j.key("late").boolean(true);
+                using R = WebOp::Note::Request;
+                j.key("request").str(n.request == R::Delivered ? "delivered"
+                                     : n.request == R::Dropped ? "dropped"
+                                     : n.request == R::InFlight ? "in-flight"
+                                                                : "unknown");
+                if (n.request == R::Delivered) {
+                    j.key("deliveredAt").num(n.at);
+                    j.key("role").str(n.role);
+                }
+                if (n.request == R::Dropped) {
+                    j.key("droppedAt").num(n.at);
+                    j.key("dropReason").str(drop_reason(n.reason));
+                }
+                if (n.up_at_end) j.key("upAtEnd").boolean(*n.up_at_end);
+                j.key("upNow").boolean(c.is_up(at.server));
+                j.raw("}");
+            }
+            j.raw("]");
         }
         j.raw("}");
     }
     j.raw("]");
 
+    j.key("client").raw("{");
+    j.key("retryTimeout").num(kv_.client(0).config().retry_timeout);
+    j.key("redirectBackoff").num(kv_.client(0).config().redirect_backoff);
+    j.raw("}");
     j.key("load").boolean(load_);
     j.key("eventCount").num(first_event_ + events_.size());
 

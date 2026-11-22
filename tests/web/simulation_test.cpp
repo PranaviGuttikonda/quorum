@@ -165,6 +165,27 @@ void check_snapshot(const Simulation& s) {
             CHECK_AT(s, !jo["server"].is_null() && c.is_server(static_cast<raft::NodeId>(jo["server"].num())));
             CHECK_AT(s, jo["sends"].num() >= 1);
         }
+        // Attempts: the client's record, plus the request's fate.
+        const auto& ja = jo["attempts"].arr();
+        CHECK_AT(s, ja.size() == w.attempts.size() && w.notes.size() == w.attempts.size());
+        CHECK_AT(s, ja.size() == jo["sends"].num());
+        for (std::size_t a = 0; a < ja.size(); ++a) {
+            const kv::Attempt& at = w.attempts[a];
+            const auto& n = w.notes[a];
+            CHECK_AT(s, ja[a]["sent"].num() == at.sent && ja[a]["server"].num() == at.server);
+            CHECK_AT(s, ja[a]["outcome"].str() == kv::to_string(at.outcome));
+            CHECK_AT(s, ja[a].has("retryAt") == (at.outcome == kv::AttemptOutcome::InFlight));
+            if (!ja[a].has("retryAt")) CHECK_AT(s, ja[a]["ended"].num() == at.ended);
+            CHECK_AT(s, ja[a]["upNow"].boolean() == c.is_up(at.server));
+            using R = Simulation::WebOp::Note::Request;
+            const std::string req = ja[a]["request"].str();
+            CHECK_AT(s, req == (n.request == R::Delivered ? "delivered" : n.request == R::Dropped ? "dropped"
+                                : n.request == R::InFlight ? "in-flight" : "unknown"));
+            // Every request was seen leaving the client.
+            CHECK_AT(s, n.msg.has_value() && req != "unknown");
+            if (req == "delivered") CHECK_AT(s, ja[a]["deliveredAt"].num() >= at.sent);
+            if (at.outcome != kv::AttemptOutcome::InFlight) CHECK_AT(s, ja[a].has("upAtEnd"));
+        }
     }
 
     // Metrics, chaos and the event count.
@@ -421,4 +442,37 @@ TEST(web_resimulating_from_actions_is_exact) {
     CHECK_EQ(run(5000), run(5000));
     CHECK(run(5000) != run(5001));
     CHECK_EQ(run(1499), run(1499));
+}
+
+TEST(web_attempts_explain_a_crashed_leader) {
+    // Put once so the client learns the leader, then put again and crash
+    // that leader in the same tick: the request is dropped on arrival, the
+    // attempt times out, and a later attempt gets the reply.
+    for (std::uint64_t seed : {1ULL, 2ULL, 3ULL, 739299ULL}) {
+        Simulation s(seed, 5);
+        s.tick(400);
+        s.submit(1, "put", "a", "1");
+        s.tick(400);
+        const raft::NodeId leader = *s.ops()[0].server;
+        CHECK_AT(s, s.leader() == std::optional<raft::NodeId>(leader));
+        s.submit(1, "put", "b", "2");
+        CHECK_AT(s, s.crash(leader));
+        for (int i = 0; i < 1200 && s.ops()[1].stats.completed == 0; i += 3) {
+            s.tick(3);
+            check_snapshot(s);
+        }
+        const auto& w = s.ops()[1];
+        CHECK_AT(s, w.server.has_value() && *w.server != leader);
+        CHECK_AT(s, w.attempts.size() >= 2);
+        CHECK_AT(s, w.attempts[0].server == leader);
+        CHECK_AT(s, w.attempts[0].outcome == kv::AttemptOutcome::Timeout);
+        CHECK_AT(s, w.notes[0].request == Simulation::WebOp::Note::Request::Dropped);
+        CHECK_AT(s, w.notes[0].reason == sim::DropReason::ReceiverDown);
+        CHECK_AT(s, w.notes[0].up_at_end == std::optional<bool>(false));
+        CHECK_AT(s, w.attempts.back().outcome == kv::AttemptOutcome::Reply);
+        const JsonValue j = parse_json(s.snapshot());
+        const auto& a0 = j["ops"][1]["attempts"][0];
+        CHECK_AT(s, a0["dropReason"].str() == "receiver-down" && a0["outcome"].str() == "timeout");
+        CHECK_AT(s, j["client"]["retryTimeout"].num() == 300);
+    }
 }
