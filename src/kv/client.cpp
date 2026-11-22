@@ -24,6 +24,7 @@ std::size_t KvClient::submit(Op op, std::string key, std::string value,
     op_ = Command{client_id_, ++seq_, op, std::move(key), std::move(value), std::move(expected)};
     op_index_ = history_.invoke(*op_, now_());
     op_stats_ = {};
+    attempts_.clear();
     send_now();
     return op_index_;
 }
@@ -36,10 +37,42 @@ NodeId KvClient::random_server_except(std::optional<NodeId> avoid) {
     }
 }
 
+const char* to_string(AttemptOutcome o) {
+    switch (o) {
+        case AttemptOutcome::InFlight: return "in-flight";
+        case AttemptOutcome::Reply: return "reply";
+        case AttemptOutcome::Redirect: return "redirect";
+        case AttemptOutcome::Timeout: return "timeout";
+        case AttemptOutcome::Superseded: return "superseded";
+    }
+    return "?";
+}
+
+void KvClient::record(NodeId server, AttemptOutcome outcome, std::optional<NodeId> hint) {
+    for (auto it = attempts_.rbegin(); it != attempts_.rend(); ++it) {
+        if (it->server != server) continue;
+        it->late = it->outcome != AttemptOutcome::InFlight;
+        it->outcome = outcome;
+        it->hint = hint;
+        it->ended = now_();
+        return;
+    }
+}
+
+void KvClient::supersede() {
+    for (Attempt& a : attempts_) {
+        if (a.outcome != AttemptOutcome::InFlight) continue;
+        a.outcome = AttemptOutcome::Superseded;
+        a.ended = now_();
+    }
+}
+
 void KvClient::send_now() {
     target_ = hint_ ? *hint_ : random_server_except(std::nullopt);
     elapsed_ = 0;
     backing_off_ = false;
+    supersede();
+    attempts_.push_back(Attempt{now_(), target_, AttemptOutcome::InFlight, std::nullopt, 0, false});
     ++stats_.sends;
     ++op_stats_.sends;
     send_(target_, encode_request(*op_));
@@ -55,6 +88,7 @@ void KvClient::tick() {
     if (elapsed_ >= config_.retry_timeout) {
         ++stats_.timeouts;
         ++op_stats_.timeouts;
+        record(target_, AttemptOutcome::Timeout);
         hint_ = random_server_except(target_);  // the target failed us: try elsewhere
         send_now();
     }
@@ -64,6 +98,8 @@ void KvClient::on_message(const sim::Message& m) {
     const auto rep = decode_reply(m.payload);
     if (!rep || !op_ || rep->client != client_id_ || rep->seq != op_->seq) return;  // stale or garbage
     if (const auto* res = std::get_if<Result>(&rep->body)) {
+        record(m.from, AttemptOutcome::Reply);
+        supersede();
         history_.complete(op_index_, now_(), *res);
         last_result_ = *res;
         op_.reset();
@@ -77,6 +113,7 @@ void KvClient::on_message(const sim::Message& m) {
     ++stats_.redirects;
     ++op_stats_.redirects;
     const auto& hint = std::get<Redirect>(rep->body).leader_hint;
+    record(m.from, AttemptOutcome::Redirect, hint);
     if (hint && *hint != target_) {
         hint_ = hint;
         send_now();

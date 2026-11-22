@@ -18,6 +18,7 @@ add_executable(quorum_tests
   raft/election_test.cpp
   raft/election_fuzz_test.cpp
   kv/state_machine_test.cpp
+  kv/client_attempts_test.cpp
   kv/kv_test.cpp
   kv/linearizability_test.cpp
   kv/kv_fuzz_test.cpp

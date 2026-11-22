@@ -12,6 +12,8 @@
 //     random server.
 //   The operation completes only when a Result for this exact (client, seq)
 //   arrives. Every invoke and completion goes into the History.
+//   Each send is also recorded as an Attempt (when, where, how it ended), for
+//   display only: nothing the client decides depends on it.
 
 #include <cstdint>
 #include <functional>
@@ -29,6 +31,29 @@ namespace quorum::kv {
 struct ClientConfig {
     Tick retry_timeout = 100;
     Tick redirect_backoff = 10;
+};
+
+// One send of the current operation, and how it ended. Recorded only: no
+// decision of the client reads it.
+enum class AttemptOutcome : std::uint8_t {
+    InFlight,    // no answer yet, and no timeout yet
+    Reply,       // a Result for this operation came back
+    Redirect,    // the server said it isn't the leader (hint, if it knew one)
+    Timeout,     // no answer within retry_timeout: the client moved on
+    Superseded,  // abandoned while in flight: another answer arrived first
+};
+
+const char* to_string(AttemptOutcome o);
+
+struct Attempt {
+    Tick sent = 0;
+    NodeId server = 0;
+    AttemptOutcome outcome = AttemptOutcome::InFlight;
+    std::optional<NodeId> hint;  // Redirect only
+    Tick ended = 0;              // when the outcome was recorded
+    // An answer that arrived after this attempt had already timed out or
+    // been superseded. The outcome is then that answer.
+    bool late = false;
 };
 
 struct ClientStats {
@@ -62,11 +87,15 @@ public:
     // Result of the most recently completed operation.
     const std::optional<Result>& last_result() const { return last_result_; }
     const ClientStats& stats() const { return stats_; }
+    const ClientConfig& config() const { return config_; }
     // The same counters for the current operation, or the last one once it
     // completes. `completed` is 1 once it has.
     const ClientStats& op_stats() const { return op_stats_; }
     // The server whose Result completed the last operation.
     std::optional<NodeId> answered_by() const { return answered_by_; }
+    // Every send of the current operation, or the last one once it
+    // completes, in order.
+    const std::vector<Attempt>& attempts() const { return attempts_; }
 
 private:
     void send_now();
@@ -92,6 +121,11 @@ private:
     ClientStats stats_;
     ClientStats op_stats_;
     std::optional<NodeId> answered_by_;
+    std::vector<Attempt> attempts_;
+    // Records `outcome` on the latest attempt sent to `server`.
+    void record(NodeId server, AttemptOutcome outcome, std::optional<NodeId> hint = std::nullopt);
+    // Marks an attempt still in flight as superseded.
+    void supersede();
 };
 
 }  // namespace quorum::kv
