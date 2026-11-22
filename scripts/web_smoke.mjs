@@ -12,7 +12,8 @@
 //             timeout or redirect line), then show "ok", collapsed to one
 //             line that expands on click.
 //           With --og <file>, the desktop run also saves a 1200x630 link
-//           preview image of the split network.
+//           preview image of the split network. --scheme light runs it all
+//           in the light colour scheme (screenshots get a -light suffix).
 //           Each step waits on what the engine reports (window.quorum
 //           snapshot). Screenshots go to the output directory. The script
 //           fails on any page error, and prints the bytes transferred.
@@ -29,6 +30,10 @@ import path from 'node:path';
 const args = process.argv.slice(2);
 const ogAt = args.indexOf('--og');
 const ogFile = ogAt >= 0 ? args.splice(ogAt, 2)[1] : null;
+// --scheme dark|light: the colour scheme the page sees (default dark).
+const schemeAt = args.indexOf('--scheme');
+const scheme = schemeAt >= 0 ? args.splice(schemeAt, 2)[1] : 'dark';
+if (scheme !== 'dark' && scheme !== 'light') throw new Error('--scheme must be dark or light');
 const [siteDir, outDir = 'screenshots'] = args;
 if (!siteDir) {
   console.error('usage: node scripts/web_smoke.mjs <site dir> [screenshot dir]');
@@ -124,6 +129,7 @@ async function run(name, width, height, mobile) {
   await S('Network.enable');
   await S('Network.setCacheDisabled', { cacheDisabled: true });
   await S('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 2, mobile });
+  await S('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: scheme }] });
   await S('Page.enable');
   await S('Page.navigate', { url: base + '#seed=7' });
 
@@ -166,15 +172,18 @@ async function run(name, width, height, mobile) {
     await sleep(250);
     const full = mobile;
     const { data } = await S('Page.captureScreenshot', { format: 'png', captureBeyondViewport: full });
-    const file = path.join(outDir, `${name}-${label}.png`);
+    const file = path.join(outDir, `${name}${scheme === 'light' ? '-light' : ''}-${label}.png`);
     writeFileSync(file, Buffer.from(data, 'base64'));
     console.log(`  ${file}`);
   };
   const snap = expr => `(() => { const s = window.quorum && window.quorum.snapshot(); return !!s && (${expr}); })()`;
 
-  console.log(`${name} ${width}x${height}`);
+  console.log(`${name} ${width}x${height} (${scheme})`);
   await until('the engine', `!!(window.quorum && window.quorum.snapshot())`);
-  await until('the font', `document.fonts.check('15px "IBM Plex Sans"')`);
+  await until('the fonts', `document.fonts.check('15px "IBM Plex Sans"') && document.fonts.check('13px "IBM Plex Mono"')`);
+  // The page must actually be in the requested scheme.
+  const page = await evaluate(`getComputedStyle(document.documentElement).getPropertyValue('--page').trim()`);
+  if (page !== (scheme === 'dark' ? '#0b1020' : '#f5f7fb')) errors.push(`page background ${page} in ${scheme} mode`);
   await shot('1-intro');
   await clickEl('start');
   await until('a leader', snap('s.leader !== null'));
