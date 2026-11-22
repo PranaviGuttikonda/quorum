@@ -6,8 +6,11 @@
 //             new leader, put and get through the console, split the network
 //             and heal it; scrub the timeline back and forward (the state at a
 //             tick must match what was there before, exactly), branch from the
-//             past, run the load generator, and run chaos until the
-//             linearizability result appears.
+//             past, run the load generator, run chaos until the
+//             linearizability result appears, and crash the leader right
+//             after sending a put: the console must explain the retry (a
+//             timeout or redirect line), then show "ok", collapsed to one
+//             line that expands on click.
 //           With --og <file>, the desktop run also saves a 1200x630 link
 //           preview image of the split network.
 //           Each step waits on what the engine reports (window.quorum
@@ -326,6 +329,53 @@ async function run(name, width, height, mobile) {
   else console.log(`  chaos: ${verdict.replace(/\s+/g, ' ').trim()}`);
   await evaluate(`document.getElementById('chaosResult').scrollIntoView({block: 'nearest'})`);
   await shot('8-chaos-result');
+
+  // Crash the leader right after sending a put. The attempt lines must say
+  // what happened (no answer from the crashed leader, or a redirect), then
+  // the op finishes "ok" and collapses to one line that expands on click.
+  await until('a settled leader', snap(`s.leader !== null && (!s.chaos || s.chaos.phase === 'done')`), 30000);
+  // A read first: whoever answers it becomes the client's leader hint.
+  await type('get y');
+  await until('the read', snap(`s.ops[s.ops.length - 1].status === 'done' && s.ops[s.ops.length - 1].server === s.leader`), 30000);
+  // Slowest speed: sending resumes playback, and at 5 ticks/s the request
+  // (8 to 20 ticks on the wire) is still in flight when the click lands.
+  const sliderAt = () => evaluate(`(() => { const e = document.getElementById('speed'); e.scrollIntoView({block: 'center'}); const b = e.getBoundingClientRect(); return {l: b.left + 2, r: b.right - 2, y: b.y + b.height / 2}; })()`);
+  let slider = await sliderAt();
+  await click(slider.l, slider.y);
+  await until('the slowest speed', `document.getElementById('speed').value === '0'`, 3000);
+  const doomed = await evaluate(snap('s.leader'));
+  await type('put y 2');
+  const opId = await evaluate(snap(`s.ops[s.ops.length - 1].id`));
+  await clickServer(doomed);
+  await until(`S${doomed} to crash`, snap(`!s.nodes[${doomed - 1}].up`), 3000);
+  const early = await evaluate(snap(`s.ops.find(o => o.id === ${opId}).attempts[0]`));
+  if (early.outcome !== 'in-flight') errors.push(`the put was answered before the crash: ${JSON.stringify(early)}`);
+  slider = await sliderAt();
+  await click(slider.r, slider.y);  // fast again for the retry
+  const opJs = `s.ops.find(o => o.id === ${opId})`;
+  await until('a retry', snap(`(${opJs}).attempts.some(a => a.outcome === 'timeout' || a.outcome === 'redirect') || (${opJs}).status === 'done'`), 30000);
+  if (await evaluate(snap(`(${opJs}).status === 'done'`)))
+    throw new Error(`${name}: put y 2 finished without a retry: ${JSON.stringify(await evaluate(snap(opJs)))}`);
+  await clickEl('play');  // pause to look at it
+  const pendingText = await evaluate(`document.querySelector('#out li[data-op="${opId}"]').innerText`);
+  if (!/→ S\d+: (no answer|not the leader|no leader known)/.test(pendingText)) errors.push(`no retry line: ${pendingText}`);
+  await evaluate(`document.querySelector('#out li[data-op="${opId}"]').scrollIntoView({block: 'nearest'})`);
+  await evaluate(`document.getElementById('out').scrollIntoView({block: 'nearest'})`);
+  await shot('9-pending-attempts');
+  console.log(`  crashed S${doomed} after sending put y 2; console: ${pendingText.split('\n').filter(l => l.startsWith('→')).join(' | ')}`);
+  await clickEl('play');
+  await until('the put to finish', snap(`(${opJs}).status === 'done'`), 30000);
+  await clickEl('play');  // pause
+  const summary = await evaluate(`document.querySelector('#out li[data-op="${opId}"] summary').innerText`);
+  if (!/^ok from S\d+ in \d+ ticks?, \d+ tr(y|ies)/.test(summary)) errors.push(`done summary: ${summary}`);
+  const sum = await evaluate(`(() => { const e = document.querySelector('#out li[data-op="${opId}"] summary'); e.scrollIntoView({block: 'nearest'}); const b = e.getBoundingClientRect(); return {x: b.x + 20, y: b.y + b.height / 2}; })()`);
+  await click(sum.x, sum.y);
+  await until('the attempts to expand', `document.querySelector('#out details[data-op="${opId}"]').open`, 3000);
+  const lines = await evaluate(`document.querySelectorAll('#out details[data-op="${opId}"] .attempts li').length`);
+  if (lines < 2) errors.push(`expanded op shows ${lines} attempt lines`);
+  await evaluate(`document.querySelector('#out details[data-op="${opId}"]').scrollIntoView({block: 'nearest'})`);
+  await shot('10-expanded');
+  console.log(`  done: "${summary}", expanded to ${lines} attempt lines`);
 
   const overflow = await evaluate(`document.documentElement.scrollWidth > window.innerWidth`);
   if (overflow) errors.push('horizontal overflow');
