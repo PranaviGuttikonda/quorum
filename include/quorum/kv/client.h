@@ -7,9 +7,17 @@
 //   - Send to the leader hint, or a random server if there is none.
 //   - A Redirect with a hint: switch to that server and resend at once.
 //   - A Redirect without a hint (an election is running): back off briefly,
-//     then try a random server.
+//     then ask the same server again. It is up and will learn the new leader
+//     within a heartbeat or so. If it still knows no leader, try a random
+//     server instead (a follower cut off in a minority never learns one, so
+//     asking it forever would stall the client).
 //   - No reply within retry_timeout: forget the hint and resend to another
 //     random server.
+//   - Random picks avoid any server that timed out within the last
+//     2 x retry_timeout, unless that excludes every server (then any server
+//     will do). A crashed server's requests are simply dropped, so without
+//     this memory the client can pick it again and wait out another full
+//     timeout.
 //   The operation completes only when a Result for this exact (client, seq)
 //   arrives. Every invoke and completion goes into the History.
 //   Each send is also recorded as an Attempt (when, where, how it ended), for
@@ -17,6 +25,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -88,6 +97,8 @@ public:
     const std::optional<Result>& last_result() const { return last_result_; }
     const ClientStats& stats() const { return stats_; }
     const ClientConfig& config() const { return config_; }
+    // Servers avoided in random picks right now (after recent timeouts).
+    std::vector<NodeId> avoided_servers() const;
     // The same counters for the current operation, or the last one once it
     // completes. `completed` is 1 once it has.
     const ClientStats& op_stats() const { return op_stats_; }
@@ -99,7 +110,10 @@ public:
 
 private:
     void send_now();
-    NodeId random_server_except(std::optional<NodeId> avoid);
+    // A uniformly random server, skipping `avoid` and every server avoided
+    // after a recent timeout. If that leaves none, any server. One draw.
+    NodeId random_server(std::optional<NodeId> avoid = std::nullopt);
+    bool avoided(NodeId server) const;
 
     const NodeId node_id_;
     const ClientId client_id_;
@@ -117,6 +131,9 @@ private:
     NodeId target_ = 0;
     Tick elapsed_ = 0;
     bool backing_off_ = false;
+    std::map<NodeId, Tick> avoid_until_;  // server -> end of its timeout exclusion
+    bool retry_same_ = false;             // the next send repeats a hint-less redirect's server
+    bool repeating_ = false;              // the current send is that repeat
     std::optional<Result> last_result_;
     ClientStats stats_;
     ClientStats op_stats_;

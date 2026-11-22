@@ -29,12 +29,27 @@ std::size_t KvClient::submit(Op op, std::string key, std::string value,
     return op_index_;
 }
 
-NodeId KvClient::random_server_except(std::optional<NodeId> avoid) {
-    if (servers_.size() == 1 || !avoid) return servers_[rng_.uniform(0, servers_.size() - 1)];
-    for (;;) {
-        const NodeId s = servers_[rng_.uniform(0, servers_.size() - 1)];
-        if (s != *avoid) return s;
-    }
+bool KvClient::avoided(NodeId server) const {
+    const auto it = avoid_until_.find(server);
+    return it != avoid_until_.end() && it->second > now_();
+}
+
+std::vector<NodeId> KvClient::avoided_servers() const {
+    std::vector<NodeId> out;
+    for (NodeId s : servers_)
+        if (avoided(s)) out.push_back(s);
+    return out;
+}
+
+// Given: some servers recently timed out (likely crashed or cut off).
+// Approach: narrow the candidates first, then make exactly one draw, so the
+//           choice stays a pure function of the seed and what the client saw.
+NodeId KvClient::random_server(std::optional<NodeId> avoid) {
+    std::vector<NodeId> pool;
+    for (NodeId s : servers_)
+        if (s != avoid && !avoided(s)) pool.push_back(s);
+    if (pool.empty()) pool = servers_;  // everyone is excluded: any server will do
+    return pool[rng_.uniform(0, pool.size() - 1)];
 }
 
 const char* to_string(AttemptOutcome o) {
@@ -68,9 +83,11 @@ void KvClient::supersede() {
 }
 
 void KvClient::send_now() {
-    target_ = hint_ ? *hint_ : random_server_except(std::nullopt);
+    target_ = hint_ ? *hint_ : random_server();
     elapsed_ = 0;
     backing_off_ = false;
+    repeating_ = retry_same_;
+    retry_same_ = false;
     supersede();
     attempts_.push_back(Attempt{now_(), target_, AttemptOutcome::InFlight, std::nullopt, 0, false});
     ++stats_.sends;
@@ -89,7 +106,9 @@ void KvClient::tick() {
         ++stats_.timeouts;
         ++op_stats_.timeouts;
         record(target_, AttemptOutcome::Timeout);
-        hint_ = random_server_except(target_);  // the target failed us: try elsewhere
+        // The target failed us: avoid it for a while, and try elsewhere.
+        avoid_until_[target_] = now_() + 2 * config_.retry_timeout;
+        hint_ = random_server(target_);
         send_now();
     }
 }
@@ -118,7 +137,14 @@ void KvClient::on_message(const sim::Message& m) {
         hint_ = hint;
         send_now();
     } else {
-        hint_.reset();
+        // No leader known yet. Ask the same server again after the backoff,
+        // unless that was already a repeat: then try someone else.
+        if (repeating_ && m.from == target_) {
+            hint_ = random_server(m.from);
+        } else {
+            hint_ = m.from;
+            retry_same_ = true;
+        }
         backing_off_ = true;
         elapsed_ = 0;
     }
