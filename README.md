@@ -61,7 +61,10 @@ Release.
 ## Visualizer
 
 The page in `web/` is plain HTML, CSS and JavaScript. It draws what the engine reports and
-nothing else. `web::Simulation` (`include/quorum/web/simulation.h`) hosts a 5-server
+nothing else. It has a dark "control room" theme, and a cool light one when the system asks
+for light. Every colour is a CSS variable, including the ones the canvases use, and text
+meets WCAG AA in both schemes. The fonts are IBM Plex Sans and IBM Plex Mono (self-hosted
+Latin-1 subsets, 78 KB in all). `web::Simulation` (`include/quorum/web/simulation.h`) hosts a 5-server
 `KvCluster` with memory storage. It is exposed to the page through embind and returns
 JSON snapshots. Building the page needs Emscripten:
 
